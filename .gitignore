@@ -11,3 +11,6 @@ wheels/
 
 .env
 .superset_token
+
+# Editor/tool local settings
+.codex/

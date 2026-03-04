@@ -34,12 +34,47 @@ npx -y @smithery/cli install @aptro/superset-mcp --client claude
 
 3. **Configure Environment Variables**
 
-   Create a `.env` file in the root directory with your Superset credentials:
+   Create a `.env` file in the root directory with your Superset credentials.
+
+   **Option 1: Using Username/Password (for local Superset instances)**
    ```
    SUPERSET_BASE_URL=http://localhost:8088  # Change to your Superset URL
    SUPERSET_USERNAME=your_username
    SUPERSET_PASSWORD=your_password
    ```
+
+   **Option 2: Using JWT Token**
+   ```
+   SUPERSET_BASE_URL=https://your-superset-instance.com
+   SUPERSET_JWT_TOKEN=your_jwt_token_here
+   ```
+
+   **Option 3: Using Session Cookie (for OAuth-enabled Superset instances like Google OAuth)**
+   ```
+   SUPERSET_BASE_URL=https://your-superset-instance.com
+   SUPERSET_SESSION_COOKIE=your_session_cookie_here
+   ```
+
+   To get your session cookie:
+   1. Log in to Superset in your browser
+   2. Open Developer Tools (F12)
+   3. Go to Application > Cookies > your Superset URL
+   4. Copy the value of the `session` cookie
+   5. Paste it into the `.env` file
+
+   **Option 4: Using Guest Tokens (for embedded dashboards)**
+
+   If your Superset instance is configured with guest token support for embedded dashboards, add these settings from your Superset configuration:
+   ```
+   SUPERSET_BASE_URL=https://your-superset-instance.com
+   GUEST_TOKEN_JWT_SECRET=your_secret_from_superset_config
+   GUEST_TOKEN_JWT_AUDIENCE=your_audience_from_superset_config
+   GUEST_ROLE_NAME=your_guest_role_name
+   ```
+
+   The MCP server can then generate guest tokens on-demand for accessing specific dashboards/charts.
+
+   Note: Priority order is: Session Cookie > JWT Token > Username/Password > Stored Token > Guest Token (generated on-demand)
 
 4. **Install Dependencies**
 
@@ -65,6 +100,8 @@ After setup, you can interact with your Superset instance via Claude using natur
 - **Create dashboard**: "Create a new dashboard titled 'Sales Overview'"
 - **Update dashboard**: "Update dashboard 3 to have the title 'Updated Sales Report'"
 - **Delete dashboard**: "Delete dashboard with ID 7"
+- **Get dashboard screenshot**: "Get a screenshot of dashboard 432"
+- **Get dashboard thumbnail**: "Get a thumbnail of dashboard 5"
 
 ### Chart Management
 
@@ -73,6 +110,7 @@ After setup, you can interact with your Superset instance via Claude using natur
 - **Create chart**: "Create a new bar chart using dataset 3"
 - **Update chart**: "Update chart 5 to use a line visualization instead of bar"
 - **Delete chart**: "Delete chart with ID 12"
+- **Export chart as image**: "Export chart 10 as an image"
 
 ### Database and Dataset Operations
 
@@ -104,6 +142,11 @@ After setup, you can interact with your Superset instance via Claude using natur
 - **Get menu data**: "What menu items do I have access to?"
 - **Get base URL**: "What is the URL of the Superset instance I'm connected to?"
 
+### Guest Token Management
+
+- **Generate guest token**: "Generate a guest token for dashboard 432"
+- **Generate with custom role**: "Generate a guest token for dashboard 432 with role 'Admin'"
+
 ### Tag Management
 
 - **List tags**: "Show me all tags in my Superset instance"
@@ -127,6 +170,12 @@ This plugin offers the following MCP tools that Claude can use:
 - `superset_dashboard_create` - Create a new dashboard
 - `superset_dashboard_update` - Update an existing dashboard
 - `superset_dashboard_delete` - Delete a dashboard
+- `superset_dashboard_cache_screenshot` - Cache a screenshot of a dashboard
+- `superset_dashboard_get_screenshot` - Get a cached screenshot of a dashboard
+- `superset_dashboard_get_thumbnail` - Get a thumbnail image of a dashboard
+
+### Guest Tokens
+- `superset_guest_token_generate` - Generate a guest token for embedded dashboards or charts
 
 ### Charts
 - `superset_chart_list` - List all charts
@@ -134,6 +183,7 @@ This plugin offers the following MCP tools that Claude can use:
 - `superset_chart_create` - Create a new chart
 - `superset_chart_update` - Update an existing chart
 - `superset_chart_delete` - Delete a chart
+- `superset_chart_export_image` - Export a chart as an image
 
 ### Databases
 - `superset_database_list` - List all databases
@@ -209,15 +259,26 @@ This plugin offers the following MCP tools that Claude can use:
 | Variable | Description | Default |
 |----------|-------------|---------|
 | SUPERSET_BASE_URL | URL of your Superset instance | http://localhost:8088 |
-| SUPERSET_USERNAME | Username for Superset | None |
-| SUPERSET_PASSWORD | Password for Superset | None |
+| SUPERSET_USERNAME | Username for Superset (for username/password auth) | None |
+| SUPERSET_PASSWORD | Password for Superset (for username/password auth) | None |
+| SUPERSET_JWT_TOKEN | JWT token for direct token-based authentication | None |
+| SUPERSET_SESSION_COOKIE | Session cookie for OAuth-based authentication (highest priority) | None |
+| GUEST_TOKEN_JWT_SECRET | Secret key for generating guest tokens (from Superset config) | None |
+| GUEST_TOKEN_JWT_AUDIENCE | JWT audience for guest tokens (from Superset config) | None |
+| GUEST_ROLE_NAME | Guest role name for embedded dashboards (from Superset config) | None |
 
 ## Troubleshooting
 
 - If you encounter authentication issues, verify your credentials in the `.env` file
+  - For JWT token authentication, ensure you have a valid JWT token (not a placeholder like `JWT_AUDIENCE`)
+  - JWT tokens should be in the format: `eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ...` (three parts separated by dots)
 - Make sure Superset is running and accessible at the URL specified in your `.env` file
 - Check that you're using a compatible version of Superset (tested with version 4.1.1)
 - Ensure the port used by the MCP server is not being used by another application
+- For screenshot functionality:
+  - The Superset instance must have the `THUMBNAILS` and `ENABLE_DASHBOARD_SCREENSHOT_ENDPOINTS` feature flags enabled
+  - A proper cache backend (like Redis) must be configured instead of NullCache
+  - If these requirements aren't met, screenshots may not be available
 
 ## Security Notes
 

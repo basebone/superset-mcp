@@ -24,6 +24,8 @@ from mcp.server.fastmcp import FastMCP, Context
 from dotenv import load_dotenv
 import json
 import logging
+import jwt
+from datetime import datetime, timedelta
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,6 +61,12 @@ load_dotenv()
 SUPERSET_BASE_URL = os.getenv("SUPERSET_BASE_URL", "http://localhost:8088")
 SUPERSET_USERNAME = os.getenv("SUPERSET_USERNAME")
 SUPERSET_PASSWORD = os.getenv("SUPERSET_PASSWORD")
+SUPERSET_JWT_TOKEN = os.getenv("SUPERSET_JWT_TOKEN")
+SUPERSET_SESSION_COOKIE = os.getenv("SUPERSET_SESSION_COOKIE")
+# Guest token configuration for embedded dashboards
+GUEST_TOKEN_JWT_SECRET = os.getenv("GUEST_TOKEN_JWT_SECRET")
+GUEST_TOKEN_JWT_AUDIENCE = os.getenv("GUEST_TOKEN_JWT_AUDIENCE")
+GUEST_ROLE_NAME = os.getenv("GUEST_ROLE_NAME")
 ACCESS_TOKEN_STORE_PATH = os.path.join(os.path.dirname(__file__), ".superset_token")
 
 # Initialize FastAPI app for handling additional web endpoints if needed
@@ -74,6 +82,8 @@ class SupersetContext:
     access_token: Optional[str] = None
     csrf_token: Optional[str] = None
     app: FastAPI = None
+    current_user_id: Optional[int] = None
+    current_username: Optional[str] = None
 
 
 def load_stored_token() -> Optional[str]:
@@ -96,6 +106,65 @@ def save_access_token(token: str):
         logger.warning(f"Warning: Could not save access token: {e}")
 
 
+def generate_guest_token(
+    resource_type: str = "dashboard",
+    resource_id: int = None,
+    rls_rules: list = None,
+    user: dict = None,
+    role_override: str = None
+) -> Optional[str]:
+    """
+    Generate a guest token for embedded Superset dashboards/charts
+
+    This matches the PHP implementation from superfull\\Auth::getGuestTokenFor()
+
+    Args:
+        resource_type: Type of resource ('dashboard' or 'chart')
+        resource_id: ID of the dashboard or chart
+        rls_rules: Optional list of row-level security rules
+        user: Optional user information dict (username, first_name, last_name)
+        role_override: Optional role name to override GUEST_ROLE_NAME
+
+    Returns:
+        JWT guest token string or None if configuration is missing
+    """
+    if not GUEST_TOKEN_JWT_SECRET or not GUEST_TOKEN_JWT_AUDIENCE:
+        logger.warning("Guest token configuration missing (GUEST_TOKEN_JWT_SECRET, GUEST_TOKEN_JWT_AUDIENCE)")
+        return None
+
+    # Default user info - matching PHP: remote_access bot
+    if user is None:
+        user = {
+            "username": "remote_access",
+            "first_name": "remote_access",
+            "last_name": "bot"
+        }
+
+    # Create the token payload - matching PHP structure exactly
+    payload = {
+        "aud": GUEST_TOKEN_JWT_AUDIENCE,
+        "resources": [{
+            "id": resource_id,  # Keep as int, not string
+            "type": resource_type
+        }],
+        "rls": [],  # Empty array for RLS
+        "rls_rules": rls_rules or [],  # Separate rls_rules field
+        "user": user,
+        "type": "guest"
+    }
+
+    # Add role if specified (either override or default from config)
+    role = role_override or GUEST_ROLE_NAME
+    if role:
+        # Superset expects roles in the user dict for guest tokens
+        if "roles" not in user:
+            user["roles"] = [role]
+
+    # Generate the token using HS256 algorithm
+    token = jwt.encode(payload, GUEST_TOKEN_JWT_SECRET, algorithm="HS256")
+    return token
+
+
 @asynccontextmanager
 async def superset_lifespan(server: FastMCP) -> AsyncIterator[SupersetContext]:
     """Manage application lifecycle for Superset integration"""
@@ -107,27 +176,90 @@ async def superset_lifespan(server: FastMCP) -> AsyncIterator[SupersetContext]:
     # Create context
     ctx = SupersetContext(client=client, base_url=SUPERSET_BASE_URL, app=app)
 
-    # Try to load existing token
-    stored_token = load_stored_token()
-    if stored_token:
-        ctx.access_token = stored_token
-        # Set the token in the client headers
-        client.headers.update({"Authorization": f"Bearer {stored_token}"})
-        logger.info("Using stored access token")
+    # Priority 1: Check for session cookie (for OAuth-based authentication)
+    if SUPERSET_SESSION_COOKIE:
+        logger.info("Using session cookie from environment variable")
+        # Extract domain from base URL for cookie
+        from urllib.parse import urlparse
+        parsed = urlparse(SUPERSET_BASE_URL)
+        domain = parsed.netloc
+
+        client.cookies.set("session", SUPERSET_SESSION_COOKIE, domain=domain)
+
+        # Try to get a JWT token using the session
+        try:
+            response = await client.post("/api/v1/security/refresh")
+            if response.status_code == 200:
+                data = response.json()
+                access_token = data.get("access_token")
+                if access_token:
+                    ctx.access_token = access_token
+                    client.headers.update({"Authorization": f"Bearer {access_token}"})
+                    save_access_token(access_token)
+                    logger.info("Successfully obtained JWT token from session cookie")
+                else:
+                    logger.warning("No access token in refresh response, using session cookie only")
+            else:
+                logger.warning(f"Failed to get JWT token from session: {response.status_code}")
+        except Exception as e:
+            logger.warning(f"Error getting JWT token from session: {e}")
+
+        # Verify the session/token works
+        try:
+            response = await client.get("/api/v1/me/")
+            if response.status_code == 200:
+                user_info = response.json()
+                logger.info(f"Authenticated as user: {user_info.get('username', 'unknown')}")
+            else:
+                logger.warning(f"Session authentication failed: {response.status_code}")
+        except Exception as e:
+            logger.warning(f"Error verifying session: {e}")
+
+    # Priority 2: Check for JWT token from environment variable
+    elif SUPERSET_JWT_TOKEN:
+        ctx.access_token = SUPERSET_JWT_TOKEN
+        client.headers.update({"Authorization": f"Bearer {SUPERSET_JWT_TOKEN}"})
+        logger.info("Using JWT token from environment variable")
 
         # Verify token validity
         try:
             response = await client.get("/api/v1/me/")
             if response.status_code != 200:
-                logger.info(
-                    f"Stored token is invalid (status {response.status_code}). Will need to re-authenticate."
+                logger.warning(
+                    f"JWT token validation failed (status {response.status_code}): {response.text}"
                 )
                 ctx.access_token = None
                 client.headers.pop("Authorization", None)
+            else:
+                logger.info("JWT token is valid and authenticated")
+                user_info = response.json()
+                logger.info(f"Authenticated as user: {user_info.get('username', 'unknown')}")
         except Exception as e:
-            logger.info(f"Error verifying stored token: {e}")
+            logger.warning(f"Error verifying JWT token: {e}")
             ctx.access_token = None
             client.headers.pop("Authorization", None)
+    else:
+        # Priority 3: Try to load existing token from file
+        stored_token = load_stored_token()
+        if stored_token:
+            ctx.access_token = stored_token
+            # Set the token in the client headers
+            client.headers.update({"Authorization": f"Bearer {stored_token}"})
+            logger.info("Using stored access token")
+
+            # Verify token validity
+            try:
+                response = await client.get("/api/v1/me/")
+                if response.status_code != 200:
+                    logger.info(
+                        f"Stored token is invalid (status {response.status_code}). Will need to re-authenticate."
+                    )
+                    ctx.access_token = None
+                    client.headers.pop("Authorization", None)
+            except Exception as e:
+                logger.info(f"Error verifying stored token: {e}")
+                ctx.access_token = None
+                client.headers.pop("Authorization", None)
 
     try:
         yield ctx
@@ -141,7 +273,7 @@ async def superset_lifespan(server: FastMCP) -> AsyncIterator[SupersetContext]:
 mcp = FastMCP(
     "superset",
     lifespan=superset_lifespan,
-    dependencies=["fastapi", "uvicorn", "python-dotenv", "httpx"],
+    dependencies=["fastapi", "uvicorn", "python-dotenv", "httpx", "PyJWT"],
 )
 
 # Type variables for generic function annotations
@@ -329,6 +461,144 @@ async def make_api_request(
     return response.json()
 
 
+def _safe_int(value: Any) -> Optional[int]:
+    """Convert a value to int when possible."""
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_resource(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize Superset API payloads that may wrap data in `result`."""
+    result = payload.get("result")
+    return result if isinstance(result, dict) else payload
+
+
+def _extract_owner_refs(resource: Dict[str, Any]) -> tuple[set[int], set[str]]:
+    """Extract owner IDs and usernames from common Superset fields."""
+    owner_ids: set[int] = set()
+    owner_names: set[str] = set()
+
+    def parse_ref(ref: Any):
+        if ref is None:
+            return
+
+        if isinstance(ref, list):
+            for item in ref:
+                parse_ref(item)
+            return
+
+        if isinstance(ref, dict):
+            for key in ("id", "user_id", "owner_id", "created_by_fk"):
+                maybe_id = _safe_int(ref.get(key))
+                if maybe_id is not None:
+                    owner_ids.add(maybe_id)
+
+            for key in ("username", "user_name", "name"):
+                value = ref.get(key)
+                if isinstance(value, str) and value.strip():
+                    owner_names.add(value.strip())
+            return
+
+        maybe_id = _safe_int(ref)
+        if maybe_id is not None:
+            owner_ids.add(maybe_id)
+
+    for field in ("owners", "owner", "created_by"):
+        parse_ref(resource.get(field))
+
+    created_by_fk = _safe_int(resource.get("created_by_fk"))
+    if created_by_fk is not None:
+        owner_ids.add(created_by_fk)
+
+    return owner_ids, owner_names
+
+
+async def get_current_user_identity(ctx: Context) -> tuple[Optional[int], Optional[str]]:
+    """Get and cache the authenticated Superset user's ID and username."""
+    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
+    if superset_ctx.current_user_id is not None or superset_ctx.current_username:
+        return superset_ctx.current_user_id, superset_ctx.current_username
+
+    me = await make_api_request(ctx, "get", "/api/v1/me/")
+    if me.get("error"):
+        return None, None
+
+    me_resource = _as_resource(me)
+    superset_ctx.current_user_id = _safe_int(me_resource.get("id"))
+
+    username = me_resource.get("username")
+    if isinstance(username, str) and username.strip():
+        superset_ctx.current_username = username.strip()
+
+    return superset_ctx.current_user_id, superset_ctx.current_username
+
+
+async def require_resource_ownership(
+    ctx: Context, resource_type: str, resource_id: int, endpoint: str
+) -> Optional[Dict[str, Any]]:
+    """Allow mutation only when the current user owns the target resource."""
+    user_id, username = await get_current_user_identity(ctx)
+    if user_id is None and not username:
+        return {
+            "error": "Unable to determine current user identity; ownership check failed."
+        }
+
+    resource_response = await make_api_request(ctx, "get", endpoint)
+    if resource_response.get("error"):
+        return {
+            "error": (
+                f"Unable to verify ownership for {resource_type} {resource_id}: "
+                f"{resource_response['error']}"
+            )
+        }
+
+    resource = _as_resource(resource_response)
+    owner_ids, owner_names = _extract_owner_refs(resource)
+    if (user_id is not None and user_id in owner_ids) or (
+        username and username in owner_names
+    ):
+        return None
+
+    owner_display = username or f"user_id={user_id}"
+    return {
+        "error": (
+            f"Permission denied: {resource_type} {resource_id} is not owned by the "
+            f"authenticated MCP user ({owner_display})."
+        )
+    }
+
+
+async def add_current_user_as_owner(
+    ctx: Context, payload: Dict[str, Any], owners_key: str = "owners"
+) -> Optional[Dict[str, Any]]:
+    """Ensure the authenticated MCP user is included in payload owners."""
+    user_id, _ = await get_current_user_identity(ctx)
+    if user_id is None:
+        return {
+            "error": (
+                "Unable to determine current user ID; refusing create operation "
+                "without explicit ownership."
+            )
+        }
+
+    owners_value = payload.get(owners_key)
+    owner_ids: set[int] = set()
+
+    if isinstance(owners_value, list):
+        for owner in owners_value:
+            owner_id = _safe_int(owner.get("id") if isinstance(owner, dict) else owner)
+            if owner_id is not None:
+                owner_ids.add(owner_id)
+
+    owner_ids.add(user_id)
+    payload[owners_key] = sorted(owner_ids)
+    return None
+
+
 # ===== Authentication Tools =====
 
 
@@ -404,7 +674,6 @@ async def superset_auth_refresh_token(ctx: Context) -> Dict[str, Any]:
 
         return {
             "message": "Successfully refreshed access token",
-            "access_token": access_token,
         }
     except Exception as e:
         return {"error": f"Error refreshing token: {str(e)}"}
@@ -442,7 +711,6 @@ async def superset_auth_authenticate_user(
         if validity.get("valid"):
             return {
                 "message": "Already authenticated with valid token",
-                "access_token": superset_ctx.access_token,
             }
 
         # Token invalid, try to refresh if requested
@@ -494,7 +762,6 @@ async def superset_auth_authenticate_user(
 
         return {
             "message": "Successfully authenticated with Superset",
-            "access_token": access_token,
         }
 
     except Exception as e:
@@ -564,6 +831,10 @@ async def superset_dashboard_create(
     if json_metadata:
         payload["json_metadata"] = json_metadata
 
+    owner_error = await add_current_user_as_owner(ctx, payload)
+    if owner_error:
+        return owner_error
+
     return await make_api_request(ctx, "post", "/api/v1/dashboard/", data=payload)
 
 
@@ -586,6 +857,12 @@ async def superset_dashboard_update(
     Returns:
         A dictionary with the updated dashboard information
     """
+    ownership_error = await require_resource_ownership(
+        ctx, "dashboard", dashboard_id, f"/api/v1/dashboard/{dashboard_id}"
+    )
+    if ownership_error:
+        return ownership_error
+
     return await make_api_request(
         ctx, "put", f"/api/v1/dashboard/{dashboard_id}", data=data
     )
@@ -607,6 +884,12 @@ async def superset_dashboard_delete(ctx: Context, dashboard_id: int) -> Dict[str
     Returns:
         A dictionary with deletion confirmation message
     """
+    ownership_error = await require_resource_ownership(
+        ctx, "dashboard", dashboard_id, f"/api/v1/dashboard/{dashboard_id}"
+    )
+    if ownership_error:
+        return ownership_error
+
     response = await make_api_request(
         ctx, "delete", f"/api/v1/dashboard/{dashboard_id}"
     )
@@ -690,6 +973,10 @@ async def superset_chart_create(
         "params": json.dumps(params),
     }
 
+    owner_error = await add_current_user_as_owner(ctx, payload)
+    if owner_error:
+        return owner_error
+
     return await make_api_request(ctx, "post", "/api/v1/chart/", data=payload)
 
 
@@ -712,6 +999,12 @@ async def superset_chart_update(
     Returns:
         A dictionary with the updated chart information
     """
+    ownership_error = await require_resource_ownership(
+        ctx, "chart", chart_id, f"/api/v1/chart/{chart_id}"
+    )
+    if ownership_error:
+        return ownership_error
+
     return await make_api_request(ctx, "put", f"/api/v1/chart/{chart_id}", data=data)
 
 
@@ -731,6 +1024,12 @@ async def superset_chart_delete(ctx: Context, chart_id: int) -> Dict[str, Any]:
     Returns:
         A dictionary with deletion confirmation message
     """
+    ownership_error = await require_resource_ownership(
+        ctx, "chart", chart_id, f"/api/v1/chart/{chart_id}"
+    )
+    if ownership_error:
+        return ownership_error
+
     response = await make_api_request(ctx, "delete", f"/api/v1/chart/{chart_id}")
 
     if not response.get("error"):
@@ -916,6 +1215,12 @@ async def superset_database_update(
     Returns:
         A dictionary with the updated database information
     """
+    ownership_error = await require_resource_ownership(
+        ctx, "database", database_id, f"/api/v1/database/{database_id}"
+    )
+    if ownership_error:
+        return ownership_error
+
     return await make_api_request(
         ctx, "put", f"/api/v1/database/{database_id}", data=data
     )
@@ -937,6 +1242,12 @@ async def superset_database_delete(ctx: Context, database_id: int) -> Dict[str, 
     Returns:
         A dictionary with deletion confirmation message
     """
+    ownership_error = await require_resource_ownership(
+        ctx, "database", database_id, f"/api/v1/database/{database_id}"
+    )
+    if ownership_error:
+        return ownership_error
+
     response = await make_api_request(ctx, "delete", f"/api/v1/database/{database_id}")
 
     if not response.get("error"):
@@ -1132,18 +1443,23 @@ async def superset_dataset_create(
     database_id: int,
     schema: str = None,
     owners: List[int] = None,
+    sql: str = None,
 ) -> Dict[str, Any]:
     """
     Create a new dataset in Superset
 
-    Makes a request to the /api/v1/dataset/ POST endpoint to create a new dataset
-    from an existing database table or view.
+    Makes a request to the /api/v1/dataset/ POST endpoint to create a new dataset.
+    Can create either a physical dataset (from an existing table) or a virtual dataset
+    (from a SQL query).
 
     Args:
-        table_name: Name of the physical table in the database
-        database_id: ID of the database where the table exists
-        schema: Optional database schema name where the table is located
+        table_name: Name for the dataset. For physical datasets this is the table name.
+                    For virtual datasets this is used as the display name.
+        database_id: ID of the database where the table exists or the query runs against
+        schema: Optional database schema name
         owners: Optional list of user IDs who should own this dataset
+        sql: Optional SQL query to create a virtual dataset. When provided, the dataset
+             will be based on this query instead of a physical table.
 
     Returns:
         A dictionary with the created dataset information including its ID
@@ -1156,10 +1472,48 @@ async def superset_dataset_create(
     if schema:
         payload["schema"] = schema
 
+    if sql:
+        payload["sql"] = sql
+
     if owners:
         payload["owners"] = owners
 
+    owner_error = await add_current_user_as_owner(ctx, payload)
+    if owner_error:
+        return owner_error
+
     return await make_api_request(ctx, "post", "/api/v1/dataset/", data=payload)
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_dataset_delete(ctx: Context, dataset_id: int) -> Dict[str, Any]:
+    """
+    Delete a dataset
+
+    Makes a request to the /api/v1/dataset/{id} DELETE endpoint to remove a dataset.
+    This operation is permanent and cannot be undone. Only datasets owned by the
+    current user can be deleted.
+
+    Args:
+        dataset_id: ID of the dataset to delete
+
+    Returns:
+        A dictionary with deletion confirmation message
+    """
+    ownership_error = await require_resource_ownership(
+        ctx, "dataset", dataset_id, f"/api/v1/dataset/{dataset_id}"
+    )
+    if ownership_error:
+        return ownership_error
+
+    response = await make_api_request(ctx, "delete", f"/api/v1/dataset/{dataset_id}")
+
+    if not response.get("error"):
+        return {"message": f"Dataset {dataset_id} deleted successfully"}
+
+    return response
 
 
 # ===== SQL Lab Tools =====
@@ -1588,6 +1942,12 @@ async def superset_tag_delete(ctx: Context, tag_id: int) -> Dict[str, Any]:
     Returns:
         A dictionary with deletion confirmation message
     """
+    ownership_error = await require_resource_ownership(
+        ctx, "tag", tag_id, f"/api/v1/tag/{tag_id}"
+    )
+    if ownership_error:
+        return ownership_error
+
     response = await make_api_request(ctx, "delete", f"/api/v1/tag/{tag_id}")
 
     if not response.get("error"):
@@ -1616,6 +1976,27 @@ async def superset_tag_object_add(
     Returns:
         A dictionary with the tagging confirmation
     """
+    endpoint_map = {
+        "chart": f"/api/v1/chart/{object_id}",
+        "dashboard": f"/api/v1/dashboard/{object_id}",
+        "dataset": f"/api/v1/dataset/{object_id}",
+        "database": f"/api/v1/database/{object_id}",
+    }
+    endpoint = endpoint_map.get(object_type.lower())
+    if not endpoint:
+        return {
+            "error": (
+                "Unsupported object_type for ownership check. "
+                "Allowed values: chart, dashboard, dataset, database."
+            )
+        }
+
+    ownership_error = await require_resource_ownership(
+        ctx, object_type, object_id, endpoint
+    )
+    if ownership_error:
+        return ownership_error
+
     payload = {
         "object_type": object_type,
         "object_id": object_id,
@@ -1646,6 +2027,27 @@ async def superset_tag_object_remove(
     Returns:
         A dictionary with the untagging confirmation message
     """
+    endpoint_map = {
+        "chart": f"/api/v1/chart/{object_id}",
+        "dashboard": f"/api/v1/dashboard/{object_id}",
+        "dataset": f"/api/v1/dataset/{object_id}",
+        "database": f"/api/v1/database/{object_id}",
+    }
+    endpoint = endpoint_map.get(object_type.lower())
+    if not endpoint:
+        return {
+            "error": (
+                "Unsupported object_type for ownership check. "
+                "Allowed values: chart, dashboard, dataset, database."
+            )
+        }
+
+    ownership_error = await require_resource_ownership(
+        ctx, object_type, object_id, endpoint
+    )
+    if ownership_error:
+        return ownership_error
+
     response = await make_api_request(
         ctx,
         "delete",
@@ -1763,6 +2165,242 @@ async def superset_menu_get(ctx: Context) -> Dict[str, Any]:
         A dictionary with menu items and their configurations
     """
     return await make_api_request(ctx, "get", "/api/v1/menu/")
+
+
+# ===== Guest Token Tools =====
+
+
+@mcp.tool()
+@handle_api_errors
+async def superset_guest_token_generate(
+    ctx: Context,
+    resource_type: str,
+    resource_id: int,
+    rls_rules: List[Dict[str, Any]] = None,
+    user_username: str = "remote_access",
+    user_first_name: str = "remote_access",
+    user_last_name: str = "bot",
+    role_name: str = None
+) -> Dict[str, Any]:
+    """
+    Generate a guest token for embedded Superset dashboards or charts
+
+    This generates a JWT guest token that can be used to access Superset resources
+    in embedded mode without requiring user authentication. This is useful for
+    embedding dashboards in external applications.
+
+    Matches the PHP implementation from superfull\\Auth::getGuestTokenFor()
+
+    Note: Requires GUEST_TOKEN_JWT_SECRET and GUEST_TOKEN_JWT_AUDIENCE to be
+    configured in your environment variables.
+
+    Args:
+        resource_type: Type of resource ('dashboard' or 'chart')
+        resource_id: ID of the dashboard or chart
+        rls_rules: Optional list of row-level security rules as dictionaries
+        user_username: Username for the guest user (default: 'remote_access')
+        user_first_name: First name for the guest user (default: 'remote_access')
+        user_last_name: Last name for the guest user (default: 'bot')
+        role_name: Optional role name to use (overrides GUEST_ROLE_NAME from config).
+                   Use this to request a different role with more permissions than the default.
+                   Example: 'Admin', 'Alpha', 'Gamma', or any custom role configured in Superset
+
+    Returns:
+        A dictionary with the generated guest token
+    """
+    user = {
+        "username": user_username,
+        "first_name": user_first_name,
+        "last_name": user_last_name
+    }
+
+    token = generate_guest_token(
+        resource_type=resource_type,
+        resource_id=resource_id,
+        rls_rules=rls_rules,
+        user=user,
+        role_override=role_name
+    )
+
+    if not token:
+        return {
+            "error": "Failed to generate guest token. Make sure GUEST_TOKEN_JWT_SECRET and GUEST_TOKEN_JWT_AUDIENCE are configured."
+        }
+
+    return {
+        "message": "Guest token generated successfully",
+        "resource_type": resource_type,
+        "resource_id": resource_id,
+        "role": role_name or GUEST_ROLE_NAME or "default",
+        "note": "Token has no expiration (matches PHP implementation). Token is stored internally and will be used automatically for subsequent API calls."
+    }
+
+
+# ===== Screenshot Tools =====
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_dashboard_cache_screenshot(
+    ctx: Context, dashboard_id: int, use_guest_token: bool = False
+) -> Dict[str, Any]:
+    """
+    Cache a screenshot of a dashboard
+
+    Makes a request to the /api/v1/dashboard/{id}/cache_dashboard_screenshot/ endpoint
+    to generate and cache a screenshot of the dashboard. This is an asynchronous operation
+    that returns an image_url which can be used to retrieve the cached screenshot.
+
+    Note: This requires the THUMBNAILS and ENABLE_DASHBOARD_SCREENSHOT_ENDPOINTS feature
+    flags to be enabled in your Superset configuration. Additionally, you need a proper
+    cache backend (like Redis) configured instead of NullCache.
+
+    Args:
+        dashboard_id: ID of the dashboard to screenshot
+
+    Returns:
+        A dictionary with the image_url for retrieving the cached screenshot or status information
+    """
+    return await make_api_request(
+        ctx, "post", f"/api/v1/dashboard/{dashboard_id}/cache_dashboard_screenshot/"
+    )
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_dashboard_get_screenshot(
+    ctx: Context, dashboard_id: int, cache_key: str
+) -> Dict[str, Any]:
+    """
+    Get a cached screenshot of a dashboard
+
+    Makes a request to the /api/v1/dashboard/{id}/screenshot/{cache_key}/ endpoint
+    to retrieve a previously cached screenshot of the dashboard.
+
+    Note: You must first call superset_dashboard_cache_screenshot to generate the
+    screenshot and obtain the cache_key.
+
+    Args:
+        dashboard_id: ID of the dashboard
+        cache_key: Cache key returned from cache_dashboard_screenshot endpoint
+
+    Returns:
+        A dictionary with the screenshot image data or error information
+    """
+    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
+
+    try:
+        response = await superset_ctx.client.get(
+            f"/api/v1/dashboard/{dashboard_id}/screenshot/{cache_key}/"
+        )
+
+        if response.status_code != 200:
+            return {
+                "error": f"Failed to get screenshot: {response.status_code} - {response.text}"
+            }
+
+        # Return the binary image data
+        return {
+            "message": "Screenshot retrieved successfully",
+            "content_type": response.headers.get("content-type", "image/png"),
+            "data": response.content.decode("latin-1") if isinstance(response.content, bytes) else response.content,
+            "size_bytes": len(response.content),
+        }
+
+    except Exception as e:
+        return {"error": f"Error retrieving screenshot: {str(e)}"}
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_dashboard_get_thumbnail(
+    ctx: Context, dashboard_id: int, digest: str
+) -> Dict[str, Any]:
+    """
+    Get a thumbnail image of a dashboard
+
+    Makes a request to the /api/v1/dashboard/{id}/thumbnail/{digest}/ endpoint
+    to retrieve a thumbnail image of the dashboard.
+
+    Note: This requires the THUMBNAILS feature flag to be enabled in your Superset configuration.
+
+    Args:
+        dashboard_id: ID of the dashboard
+        digest: Digest/hash for the thumbnail version
+
+    Returns:
+        A dictionary with the thumbnail image data or error information
+    """
+    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
+
+    try:
+        response = await superset_ctx.client.get(
+            f"/api/v1/dashboard/{dashboard_id}/thumbnail/{digest}/"
+        )
+
+        if response.status_code != 200:
+            return {
+                "error": f"Failed to get thumbnail: {response.status_code} - {response.text}"
+            }
+
+        # Return the binary image data
+        return {
+            "message": "Thumbnail retrieved successfully",
+            "content_type": response.headers.get("content-type", "image/png"),
+            "data": response.content.decode("latin-1") if isinstance(response.content, bytes) else response.content,
+            "size_bytes": len(response.content),
+        }
+
+    except Exception as e:
+        return {"error": f"Error retrieving thumbnail: {str(e)}"}
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_chart_export_image(
+    ctx: Context, chart_id: int
+) -> Dict[str, Any]:
+    """
+    Export a chart as an image
+
+    Makes a request to the /api/v1/chart/export/ endpoint to export a chart
+    as an image file (PNG or JPEG format).
+
+    Args:
+        chart_id: ID of the chart to export
+
+    Returns:
+        A dictionary with the image data or error information
+    """
+    payload = {"chart_id": chart_id}
+
+    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
+
+    try:
+        response = await superset_ctx.client.post(
+            "/api/v1/chart/export/",
+            json=payload
+        )
+
+        if response.status_code != 200:
+            return {
+                "error": f"Failed to export chart: {response.status_code} - {response.text}"
+            }
+
+        # Return the binary image data
+        return {
+            "message": "Chart exported successfully",
+            "content_type": response.headers.get("content-type", "image/png"),
+            "data": response.content.decode("latin-1") if isinstance(response.content, bytes) else response.content,
+            "size_bytes": len(response.content),
+        }
+
+    except Exception as e:
+        return {"error": f"Error exporting chart: {str(e)}"}
 
 
 # ===== Configuration Tools =====
