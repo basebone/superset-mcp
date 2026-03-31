@@ -15,7 +15,6 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from mcp.server.auth.middleware.bearer_auth import AccessToken
-from pydantic import AnyUrl
 
 from mcp.server.auth.provider import (
     AuthorizationCode,
@@ -53,18 +52,6 @@ class _StoredAccessToken:
     client_id: str
     scopes: list[str]
     expires_at: float
-
-
-class _OpenRedirectClient(OAuthClientInformationFull):
-    """Subclass that accepts any redirect URI for authenticated clients."""
-
-    def validate_redirect_uri(self, redirect_uri: AnyUrl | None) -> AnyUrl:
-        if redirect_uri is not None:
-            return redirect_uri
-        if self.redirect_uris and len(self.redirect_uris) == 1:
-            return self.redirect_uris[0]
-        from mcp.shared.auth import InvalidRedirectUriError
-        raise InvalidRedirectUriError("redirect_uri is required")
 
 
 # Provider -----------------------------------------------------------------
@@ -106,7 +93,7 @@ class MCPOAuthProvider:
 
         # Seed the pre-configured OAuth clients.
         for entry in self.clients:
-            self._clients[entry.client_id] = _OpenRedirectClient(
+            self._clients[entry.client_id] = OAuthClientInformationFull(
                 client_id=entry.client_id,
                 client_secret=entry.client_secret,
                 client_id_issued_at=int(time.time()),
