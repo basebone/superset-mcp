@@ -9,6 +9,8 @@ from typing import (
     Awaitable,
     Union,
 )
+import argparse
+import ipaddress
 import os
 import httpx
 from contextlib import asynccontextmanager
@@ -269,12 +271,70 @@ async def superset_lifespan(server: FastMCP) -> AsyncIterator[SupersetContext]:
         await client.aclose()
 
 
+# ---------------------------------------------------------------------------
+# HTTP transport configuration (from environment variables)
+# ---------------------------------------------------------------------------
+MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "stdio")  # stdio | streamable-http | sse | both
+MCP_HTTP_HOST = os.getenv("MCP_HTTP_HOST", "0.0.0.0")
+MCP_HTTP_PORT = int(os.getenv("MCP_HTTP_PORT", "8044"))
+MCP_ISSUER_URL = os.getenv("MCP_ISSUER_URL", "http://localhost:8044")
+MCP_TLS_CERTFILE = os.getenv("MCP_TLS_CERTFILE")
+MCP_TLS_KEYFILE = os.getenv("MCP_TLS_KEYFILE")
+# OAuth clients: comma-separated "id:secret" pairs
+# e.g. "claude-ai:secret1,chatgpt:secret2"
+MCP_OAUTH_CLIENTS = os.getenv("MCP_OAUTH_CLIENTS", "")
+# Static API tokens: comma-separated
+MCP_API_TOKENS = os.getenv("MCP_API_TOKENS", "")
+# IP allowlist: comma-separated CIDRs
+MCP_ALLOWED_IPS = os.getenv("MCP_ALLOWED_IPS", "")
+# Trusted proxies: comma-separated IPs
+MCP_TRUSTED_PROXIES = os.getenv("MCP_TRUSTED_PROXIES", "")
+
+
+def _build_mcp_kwargs() -> dict:
+    """Build FastMCP constructor kwargs, adding OAuth when using HTTP transport."""
+    kwargs: Dict[str, Any] = {
+        "name": "superset",
+        "lifespan": superset_lifespan,
+        "dependencies": ["fastapi", "uvicorn", "python-dotenv", "httpx", "PyJWT"],
+    }
+
+    transport = os.getenv("MCP_TRANSPORT", "stdio")
+    if transport in ("streamable-http", "sse", "both"):
+        from auth import MCPOAuthProvider, OAuthClientEntry
+
+        # Parse OAuth clients from env
+        client_entries = []
+        if MCP_OAUTH_CLIENTS:
+            for pair in MCP_OAUTH_CLIENTS.split(","):
+                pair = pair.strip()
+                if ":" in pair:
+                    cid, csec = pair.split(":", 1)
+                    client_entries.append(OAuthClientEntry(client_id=cid.strip(), client_secret=csec.strip()))
+
+        if not client_entries:
+            raise SystemExit(
+                "HTTP transport requires at least one OAuth client. "
+                "Set MCP_OAUTH_CLIENTS='client_id:client_secret' in environment."
+            )
+
+        api_tokens = [t.strip() for t in MCP_API_TOKENS.split(",") if t.strip()] if MCP_API_TOKENS else []
+
+        provider = MCPOAuthProvider(clients=client_entries, api_tokens=api_tokens)
+        kwargs.update(
+            host=MCP_HTTP_HOST,
+            port=MCP_HTTP_PORT,
+            auth_server_provider=provider,
+            issuer_url=MCP_ISSUER_URL,
+        )
+        logger.info("HTTP transport configured on %s:%s (OAuth clients: %d)",
+                     MCP_HTTP_HOST, MCP_HTTP_PORT, len(client_entries))
+
+    return kwargs
+
+
 # Initialize FastMCP server with lifespan and dependencies
-mcp = FastMCP(
-    "superset",
-    lifespan=superset_lifespan,
-    dependencies=["fastapi", "uvicorn", "python-dotenv", "httpx", "PyJWT"],
-)
+mcp = FastMCP(**_build_mcp_kwargs())
 
 # Type variables for generic function annotations
 T = TypeVar("T")
@@ -2477,6 +2537,138 @@ async def superset_advanced_data_type_list(ctx: Context) -> Dict[str, Any]:
     return await make_api_request(ctx, "get", "/api/v1/advanced_data_type/types")
 
 
+def _get_client_ip(request, trusted_proxies: set) -> str:
+    """Resolve the real client IP, respecting X-Forwarded-For from trusted proxies."""
+    peer_ip = request.client.host if request.client else "unknown"
+    if peer_ip in trusted_proxies:
+        xff = request.headers.get("x-forwarded-for", "")
+        if xff:
+            return xff.split(",")[0].strip()
+    return peer_ip
+
+
+async def _run_http(server: FastMCP, transport: str) -> None:
+    """Run HTTP-based transport with optional TLS, IP allowlist, and health check."""
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.requests import Request as StarletteRequest
+    from starlette.responses import JSONResponse, PlainTextResponse
+
+    trusted_proxies = set(t.strip() for t in MCP_TRUSTED_PROXIES.split(",") if t.strip())
+
+    # Build IP allowlist
+    allow_nets = None
+    if MCP_ALLOWED_IPS:
+        allow_nets = [ipaddress.ip_network(e.strip(), strict=False)
+                      for e in MCP_ALLOWED_IPS.split(",") if e.strip()]
+        logger.info("IP allowlist active: %s", [str(n) for n in allow_nets])
+
+    async def _health_check(request: StarletteRequest) -> JSONResponse:
+        """Unauthenticated health check — tests Superset API connectivity."""
+        try:
+            async with httpx.AsyncClient(base_url=SUPERSET_BASE_URL, timeout=10.0) as client:
+                resp = await client.get("/health")
+                if resp.status_code == 200:
+                    return JSONResponse({"status": "ok"}, status_code=200)
+                return JSONResponse({"status": "error", "detail": f"Superset returned {resp.status_code}"}, status_code=503)
+        except Exception as exc:
+            logger.error("Health check failed: %s", exc)
+            return JSONResponse({"status": "error", "detail": str(exc)}, status_code=503)
+
+    class _IPAllowlistMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request: StarletteRequest, call_next):
+            # Health check — bypass IP allowlist and auth.
+            if request.url.path == "/health":
+                return await _health_check(request)
+            if allow_nets is not None:
+                client_ip = _get_client_ip(request, trusted_proxies)
+                try:
+                    addr = ipaddress.ip_address(client_ip)
+                except ValueError:
+                    logger.warning("Rejected request with unparseable IP: %s", client_ip)
+                    return PlainTextResponse("Forbidden", status_code=403)
+                if not any(addr in net for net in allow_nets):
+                    logger.warning("Rejected request from %s (not in allowlist)", client_ip)
+                    return PlainTextResponse("Forbidden", status_code=403)
+            return await call_next(request)
+
+    # Build ASGI app(s)
+    if transport == "both":
+        from starlette.applications import Starlette
+
+        http_app = server.streamable_http_app()
+        sse_app = server.sse_app()
+
+        seen_paths: set = set()
+        merged_routes = []
+        for route in http_app.routes:
+            path = getattr(route, "path", None)
+            if path not in seen_paths:
+                seen_paths.add(path)
+                merged_routes.append(route)
+        for route in sse_app.routes:
+            path = getattr(route, "path", None)
+            if path not in seen_paths:
+                seen_paths.add(path)
+                merged_routes.append(route)
+
+        starlette_app = Starlette(
+            debug=http_app.debug,
+            routes=merged_routes,
+            middleware=list(http_app.user_middleware),
+            lifespan=lambda app: server.session_manager.run(),
+        )
+    elif transport == "sse":
+        starlette_app = server.sse_app()
+    else:
+        starlette_app = server.streamable_http_app()
+
+    starlette_app.add_middleware(_IPAllowlistMiddleware)
+
+    uv_kwargs: Dict[str, Any] = {
+        "host": server.settings.host,
+        "port": server.settings.port,
+        "log_level": "info",
+    }
+    if MCP_TLS_CERTFILE and MCP_TLS_KEYFILE:
+        uv_kwargs["ssl_certfile"] = MCP_TLS_CERTFILE
+        uv_kwargs["ssl_keyfile"] = MCP_TLS_KEYFILE
+        logger.info("TLS enabled with cert %s", MCP_TLS_CERTFILE)
+    else:
+        logger.info("TLS disabled (expecting upstream TLS termination)")
+
+    config = uvicorn.Config(starlette_app, **uv_kwargs)
+    uv_server = uvicorn.Server(config)
+    await uv_server.serve()
+
+
+def run():
+    """Parse args and start the MCP server."""
+    parser = argparse.ArgumentParser(description="Superset MCP Server")
+    parser.add_argument(
+        "--transport",
+        default=None,
+        choices=["stdio", "streamable-http", "sse", "both"],
+        help="MCP transport (default: from MCP_TRANSPORT env or stdio)",
+    )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+    )
+    args = parser.parse_args()
+
+    logging.basicConfig(level=getattr(logging, args.log_level.upper()), force=True)
+
+    transport = args.transport or MCP_TRANSPORT
+
+    logger.info("Starting Superset MCP server (transport=%s)...", transport)
+
+    if transport in ("streamable-http", "sse", "both"):
+        import anyio
+        anyio.run(_run_http, mcp, transport)
+    else:
+        mcp.run(transport="stdio")
+
+
 if __name__ == "__main__":
-    logger.info("Starting Superset MCP server...")
-    mcp.run()
+    run()

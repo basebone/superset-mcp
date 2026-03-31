@@ -17,14 +17,17 @@ classifiers = [
 dependencies = [
     "fastapi>=0.115.0",
     "httpx>=0.28.0",
-    "mcp[cli]>=1.4.0",
+    "mcp[cli]>=1.26.0",
+    "pydantic>=2.0.0",
+    "starlette>=0.36.0",
+    "anyio>=4.0",
     "uvicorn>=0.34.0",
     "python-dotenv>=1.0.0",
     "PyJWT>=2.8.0",
 ]
 
 [tool.setuptools]
-py-modules = ["main"]
+py-modules = ["main", "auth"]
 
 [project.urls]
 Homepage = "https://github.com/yourusername/superset-mcp"
