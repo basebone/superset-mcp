@@ -1576,6 +1576,80 @@ async def superset_dataset_delete(ctx: Context, dataset_id: int) -> Dict[str, An
     return response
 
 
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_dataset_update(
+    ctx: Context,
+    dataset_id: int,
+    table_name: str = None,
+    description: str = None,
+    sql: str = None,
+    schema: str = None,
+    owners: List[int] = None,
+    cache_timeout: int = None,
+    columns: List[Dict[str, Any]] = None,
+    metrics: List[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Update an existing dataset in Superset
+
+    Makes a request to the /api/v1/dataset/{id} PUT endpoint to update an existing
+    dataset. Only datasets owned by the current user can be updated.
+
+    Args:
+        dataset_id: ID of the dataset to update
+        table_name: New name for the dataset
+        description: New description for the dataset
+        sql: New SQL query (for virtual datasets)
+        schema: New database schema name
+        owners: New list of user IDs who should own this dataset
+        cache_timeout: Cache timeout in seconds
+        columns: List of column definitions (each a dict with keys like
+                 column_name, type, filterable, groupby, etc.)
+        metrics: List of metric definitions (each a dict with keys like
+                 metric_name, expression, etc.)
+
+    Returns:
+        A dictionary with the updated dataset information
+    """
+    ownership_error = await require_resource_ownership(
+        ctx, "dataset", dataset_id, f"/api/v1/dataset/{dataset_id}"
+    )
+    if ownership_error:
+        return ownership_error
+
+    payload = {}
+
+    if table_name is not None:
+        payload["table_name"] = table_name
+    if description is not None:
+        payload["description"] = description
+    if sql is not None:
+        payload["sql"] = sql
+    if schema is not None:
+        payload["schema"] = schema
+    if owners is not None:
+        payload["owners"] = owners
+    if cache_timeout is not None:
+        payload["cache_timeout"] = cache_timeout
+    if columns is not None:
+        payload["columns"] = columns
+    if metrics is not None:
+        payload["metrics"] = metrics
+
+    if not payload:
+        return {"error": "No fields provided to update"}
+
+    owner_error = await add_current_user_as_owner(ctx, payload)
+    if owner_error:
+        return owner_error
+
+    return await make_api_request(
+        ctx, "put", f"/api/v1/dataset/{dataset_id}", data=payload
+    )
+
+
 # ===== SQL Lab Tools =====
 
 
