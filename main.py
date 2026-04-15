@@ -278,6 +278,7 @@ MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "stdio")  # stdio | streamable-http |
 MCP_HTTP_HOST = os.getenv("MCP_HTTP_HOST", "0.0.0.0")
 MCP_HTTP_PORT = int(os.getenv("MCP_HTTP_PORT", "8044"))
 MCP_ISSUER_URL = os.getenv("MCP_ISSUER_URL", "http://localhost:8044")
+MCP_RESOURCE_SERVER_URL = os.getenv("MCP_RESOURCE_SERVER_URL") or None
 MCP_TLS_CERTFILE = os.getenv("MCP_TLS_CERTFILE")
 MCP_TLS_KEYFILE = os.getenv("MCP_TLS_KEYFILE")
 # OAuth clients: comma-separated "id:secret" pairs
@@ -302,6 +303,7 @@ def _build_mcp_kwargs() -> dict:
     transport = os.getenv("MCP_TRANSPORT", "stdio")
     if transport in ("streamable-http", "sse", "both"):
         from auth import MCPOAuthProvider, OAuthClientEntry
+        from mcp.server.auth.settings import AuthSettings
 
         # Parse OAuth clients from env
         client_entries = []
@@ -325,7 +327,10 @@ def _build_mcp_kwargs() -> dict:
             host=MCP_HTTP_HOST,
             port=MCP_HTTP_PORT,
             auth_server_provider=provider,
-            issuer_url=MCP_ISSUER_URL,
+            auth=AuthSettings(
+                issuer_url=MCP_ISSUER_URL,
+                resource_server_url=MCP_RESOURCE_SERVER_URL,
+            ),
         )
         logger.info("HTTP transport configured on %s:%s (OAuth clients: %d)",
                      MCP_HTTP_HOST, MCP_HTTP_PORT, len(client_entries))
