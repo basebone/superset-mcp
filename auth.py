@@ -120,8 +120,12 @@ class MCPOAuthProvider:
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
         return self._clients.get(client_id)
 
-    async def register_client(self, client_info: OAuthClientInformationFull) -> None:
-        raise NotImplementedError("Dynamic client registration is disabled")
+    async def register_client(self, client_info: OAuthClientInformationFull) -> OAuthClientInformationFull:
+        """Accept dynamic client registration (required for Claude.ai, ChatGPT, etc.)."""
+        self._clients[client_info.client_id] = client_info
+        LOG.info("Dynamically registered client: %s (%s)",
+                 client_info.client_id, client_info.client_name or "unnamed")
+        return client_info
 
     # -- Authorization ------------------------------------------------------
 
