@@ -278,7 +278,6 @@ MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "stdio")  # stdio | streamable-http |
 MCP_HTTP_HOST = os.getenv("MCP_HTTP_HOST", "0.0.0.0")
 MCP_HTTP_PORT = int(os.getenv("MCP_HTTP_PORT", "8044"))
 MCP_ISSUER_URL = os.getenv("MCP_ISSUER_URL", "http://localhost:8044")
-MCP_RESOURCE_SERVER_URL = os.getenv("MCP_RESOURCE_SERVER_URL") or None
 MCP_TLS_CERTFILE = os.getenv("MCP_TLS_CERTFILE")
 MCP_TLS_KEYFILE = os.getenv("MCP_TLS_KEYFILE")
 # OAuth clients: comma-separated "id:secret" pairs
@@ -303,7 +302,7 @@ def _build_mcp_kwargs() -> dict:
     transport = os.getenv("MCP_TRANSPORT", "stdio")
     if transport in ("streamable-http", "sse", "both"):
         from auth import MCPOAuthProvider, OAuthClientEntry
-        from mcp.server.auth.settings import AuthSettings
+        from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
 
         # Parse OAuth clients from env
         client_entries = []
@@ -329,7 +328,9 @@ def _build_mcp_kwargs() -> dict:
             auth_server_provider=provider,
             auth=AuthSettings(
                 issuer_url=MCP_ISSUER_URL,
-                resource_server_url=MCP_RESOURCE_SERVER_URL,
+                resource_server_url=MCP_ISSUER_URL,
+                client_registration_options=ClientRegistrationOptions(enabled=False),
+                revocation_options=RevocationOptions(enabled=True),
             ),
         )
         logger.info("HTTP transport configured on %s:%s (OAuth clients: %d)",
@@ -2617,20 +2618,39 @@ async def superset_advanced_data_type_list(ctx: Context) -> Dict[str, Any]:
 
 
 def _get_client_ip(request, trusted_proxies: set) -> str:
-    """Resolve the real client IP, respecting X-Forwarded-For from trusted proxies."""
+    """Resolve the real client IP, respecting X-Real-IP / X-Forwarded-For from trusted proxies."""
+    import ipaddress as _ipaddress
+
     peer_ip = request.client.host if request.client else "unknown"
     if peer_ip in trusted_proxies:
+        # Prefer X-Real-IP (single trusted value set by HAProxy).
+        real_ip = request.headers.get("x-real-ip", "").strip()
+        if real_ip:
+            try:
+                _ipaddress.ip_address(real_ip)
+                return real_ip
+            except ValueError:
+                pass
+
+        # Fall back to first entry of X-Forwarded-For.
         xff = request.headers.get("x-forwarded-for", "")
         if xff:
-            return xff.split(",")[0].strip()
+            candidate = xff.split(",")[0].strip()
+            try:
+                _ipaddress.ip_address(candidate)
+                return candidate
+            except ValueError:
+                pass
     return peer_ip
 
 
 async def _run_http(server: FastMCP, transport: str) -> None:
     """Run HTTP-based transport with optional TLS, IP allowlist, and health check."""
+    import json as _json
+
     from starlette.middleware.base import BaseHTTPMiddleware
     from starlette.requests import Request as StarletteRequest
-    from starlette.responses import JSONResponse, PlainTextResponse
+    from starlette.responses import JSONResponse, PlainTextResponse, Response
 
     trusted_proxies = set(t.strip() for t in MCP_TRUSTED_PROXIES.split(",") if t.strip())
 
@@ -2670,6 +2690,189 @@ async def _run_http(server: FastMCP, transport: str) -> None:
                     return PlainTextResponse("Forbidden", status_code=403)
             return await call_next(request)
 
+    # Paths where the MCP SDK auth middleware would reject OPTIONS preflight.
+    _AUTH_PROTECTED_PATHS = {"/mcp", "/sse", "/messages", "/messages/"}
+    # Public metadata paths where CORS should always be wildcard.
+    _WELLKNOWN_PATHS = {
+        "/.well-known/oauth-authorization-server",
+        "/.well-known/oauth-protected-resource",
+    }
+
+    class _TokenErrorSanitizer:
+        """Raw ASGI middleware that sanitizes OAuth error details on auth endpoints.
+
+        Prevents Pydantic validation internals and client-enumeration details
+        from leaking in error responses.  Operates at the ASGI protocol level
+        because Starlette's BaseHTTPMiddleware cannot reliably intercept
+        response bodies.
+        """
+
+        _TOKEN_PATHS = frozenset({"/token", "/revoke"})
+        _AUTHORIZE_PATH = "/authorize"
+        _SANITIZE_PATHS = _TOKEN_PATHS | {_AUTHORIZE_PATH}
+        _SUPPORTED_GRANTS = frozenset({"authorization_code", "refresh_token", "client_credentials"})
+        _PYDANTIC_MARKERS = ("discriminator", "Input tag", "expected tags", "extract tag", "validation error")
+        _ENUMERATE_MARKERS = ("not found", "not registered")
+
+        def __init__(self, app):
+            self.app = app
+
+        async def __call__(self, scope, receive, send):
+            if scope["type"] != "http":
+                await self.app(scope, receive, send)
+                return
+
+            path = scope.get("path", "")
+            method = scope.get("method", "GET")
+            if path not in self._SANITIZE_PATHS:
+                await self.app(scope, receive, send)
+                return
+
+            # Token/revoke require POST; authorize allows GET and POST.
+            if path in self._TOKEN_PATHS and method != "POST":
+                await self.app(scope, receive, send)
+                return
+            if path == self._AUTHORIZE_PATH and method not in ("GET", "POST"):
+                await self.app(scope, receive, send)
+                return
+
+            # Buffer the incoming request body so we can derive grant_type later.
+            request_body_parts: list[bytes] = []
+
+            async def capture_receive():
+                message = await receive()
+                if message["type"] == "http.request":
+                    request_body_parts.append(message.get("body", b""))
+                return message
+
+            # Buffer the response to inspect for Pydantic leakage.
+            status_code = 200
+            response_headers: list[tuple[bytes, bytes]] = []
+            body_chunks: list[bytes] = []
+
+            async def capture_send(message):
+                nonlocal status_code, response_headers
+
+                if message["type"] == "http.response.start":
+                    status_code = message.get("status", 200)
+                    response_headers = list(message.get("headers", []))
+                    return  # Hold — wait for the full body before forwarding.
+
+                if message["type"] != "http.response.body":
+                    await send(message)
+                    return
+
+                body_chunks.append(message.get("body", b""))
+                if message.get("more_body", False):
+                    return  # Keep accumulating.
+
+                # --- Full response received ---
+                full_body = b"".join(body_chunks)
+
+                if status_code < 400:
+                    # Success — forward unchanged.
+                    await send({"type": "http.response.start", "status": status_code, "headers": response_headers})
+                    await send({"type": "http.response.body", "body": full_body})
+                    return
+
+                # 4xx/5xx — check if the body needs sanitization.
+                needs_sanitize = True
+                try:
+                    parsed = _json.loads(full_body)
+                    if isinstance(parsed, dict) and "error" in parsed:
+                        desc = str(parsed.get("error_description", ""))
+                        if path == self._AUTHORIZE_PATH:
+                            # Prevent client ID enumeration: genericize if
+                            # the description reveals client/redirect info.
+                            desc_lower = desc.lower()
+                            if any(m in desc_lower for m in self._ENUMERATE_MARKERS) or \
+                               any(m in desc for m in self._PYDANTIC_MARKERS):
+                                needs_sanitize = True
+                            else:
+                                needs_sanitize = False
+                        else:
+                            # Token/revoke: only sanitize Pydantic leakage.
+                            if not any(m in desc for m in self._PYDANTIC_MARKERS):
+                                needs_sanitize = False
+                except (ValueError, UnicodeDecodeError):
+                    pass
+
+                if not needs_sanitize:
+                    await send({"type": "http.response.start", "status": status_code, "headers": response_headers})
+                    await send({"type": "http.response.body", "body": full_body})
+                    return
+
+                # Build the safe replacement error body.
+                if path == self._AUTHORIZE_PATH:
+                    error_code, error_desc = "invalid_request", "The authorization request is invalid"
+                else:
+                    error_code, error_desc = self._rfc6749_error(request_body_parts)
+                replacement = _json.dumps({"error": error_code, "error_description": error_desc}).encode("utf-8")
+
+                new_headers = [
+                    (k, v) for k, v in response_headers
+                    if k.lower() not in (b"content-length", b"content-type")
+                ]
+                new_headers.append((b"content-type", b"application/json"))
+                new_headers.append((b"content-length", str(len(replacement)).encode()))
+
+                await send({"type": "http.response.start", "status": 400, "headers": new_headers})
+                await send({"type": "http.response.body", "body": replacement})
+
+            await self.app(scope, capture_receive, capture_send)
+
+        @classmethod
+        def _rfc6749_error(cls, request_body_parts: list[bytes]) -> tuple[str, str]:
+            """Derive an RFC 6749 error code and description from the buffered request body."""
+            from urllib.parse import parse_qs
+
+            raw = b"".join(request_body_parts).decode("utf-8", errors="replace")
+            params = parse_qs(raw)
+            grant_type = (params.get("grant_type") or [None])[0]
+
+            if grant_type is None:
+                return "invalid_request", "Missing required parameter: grant_type"
+            if grant_type not in cls._SUPPORTED_GRANTS:
+                safe_gt = "".join(c for c in grant_type[:64] if c.isalnum() or c == "_")
+                return "unsupported_grant_type", f"Grant type '{safe_gt}' is not supported"
+            return "invalid_request", "The request is malformed or missing required parameters"
+
+    class _SecurityHeadersMiddleware(BaseHTTPMiddleware):
+        """Outermost middleware: CORS preflight and security headers."""
+        async def dispatch(self, request: StarletteRequest, call_next):
+            path = request.url.path
+
+            # --- CORS preflight: respond before auth middleware can reject it ---
+            if request.method == "OPTIONS" and path in _AUTH_PROTECTED_PATHS:
+                origin = request.headers.get("origin", "*")
+                return Response(
+                    status_code=204,
+                    headers={
+                        "Access-Control-Allow-Origin": origin,
+                        "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+                        "Access-Control-Allow-Headers": "Authorization, Content-Type, Accept, Mcp-Session-Id",
+                        "Access-Control-Max-Age": "86400",
+                        "X-Content-Type-Options": "nosniff",
+                        "X-Frame-Options": "DENY",
+                        "Referrer-Policy": "strict-origin-when-cross-origin",
+                    },
+                )
+
+            response = await call_next(request)
+
+            # --- Security headers on all responses ---
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            response.headers["X-Frame-Options"] = "DENY"
+            response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+
+            # --- Force wildcard CORS on public metadata endpoints ---
+            if path in _WELLKNOWN_PATHS:
+                response.headers["Access-Control-Allow-Origin"] = "*"
+                if "Vary" in response.headers:
+                    del response.headers["Vary"]
+
+            return response
+
     # Build ASGI app(s)
     if transport == "both":
         from starlette.applications import Starlette
@@ -2701,7 +2904,12 @@ async def _run_http(server: FastMCP, transport: str) -> None:
     else:
         starlette_app = server.streamable_http_app()
 
+    # Middleware order (outermost → innermost):
+    #   _SecurityHeadersMiddleware → _IPAllowlistMiddleware → _TokenErrorSanitizer → app
+    # Starlette add_middleware prepends, so add in reverse order.
+    starlette_app.add_middleware(_TokenErrorSanitizer)
     starlette_app.add_middleware(_IPAllowlistMiddleware)
+    starlette_app.add_middleware(_SecurityHeadersMiddleware)
 
     uv_kwargs: Dict[str, Any] = {
         "host": server.settings.host,
