@@ -285,6 +285,9 @@ MCP_TLS_KEYFILE = os.getenv("MCP_TLS_KEYFILE")
 MCP_OAUTH_CLIENTS = os.getenv("MCP_OAUTH_CLIENTS", "")
 # Static API tokens: comma-separated
 MCP_API_TOKENS = os.getenv("MCP_API_TOKENS", "")
+# Optional SQLite file for persisting OAuth-issued tokens across restarts.
+# Omit to keep tokens in memory only (they are lost on restart).
+MCP_TOKEN_DB = os.getenv("MCP_TOKEN_DB", "")
 # IP allowlist: comma-separated CIDRs
 MCP_ALLOWED_IPS = os.getenv("MCP_ALLOWED_IPS", "")
 # Trusted proxies: comma-separated IPs
@@ -321,7 +324,15 @@ def _build_mcp_kwargs() -> dict:
 
         api_tokens = [t.strip() for t in MCP_API_TOKENS.split(",") if t.strip()] if MCP_API_TOKENS else []
 
-        provider = MCPOAuthProvider(clients=client_entries, api_tokens=api_tokens)
+        from token_store import InMemoryTokenStore, SqliteTokenStore
+
+        token_store = SqliteTokenStore(MCP_TOKEN_DB) if MCP_TOKEN_DB else InMemoryTokenStore()
+
+        provider = MCPOAuthProvider(
+            clients=client_entries,
+            api_tokens=api_tokens,
+            token_store=token_store,
+        )
         kwargs.update(
             host=MCP_HTTP_HOST,
             port=MCP_HTTP_PORT,

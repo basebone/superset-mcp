@@ -7,12 +7,10 @@ client_secret); dynamic registration is disabled.
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import secrets
 import time
 from dataclasses import dataclass, field
-from typing import Optional
 
 from mcp.server.auth.middleware.bearer_auth import AccessToken
 
@@ -22,6 +20,9 @@ from mcp.server.auth.provider import (
     OAuthClientInformationFull,
     OAuthToken,
 )
+
+from auth_records import _StoredAccessToken, _StoredRefreshToken
+from token_store import InMemoryTokenStore, TokenStore
 
 
 LOG = logging.getLogger("superset_mcp.auth")
@@ -36,22 +37,8 @@ def _random_token(nbytes: int = 32) -> str:
     return secrets.token_urlsafe(nbytes)
 
 
-# Internal bookkeeping -----------------------------------------------------
-
-@dataclass(slots=True)
-class _StoredRefreshToken:
-    token: str
-    client_id: str
-    scopes: list[str]
-    expires_at: float
-
-
-@dataclass(slots=True)
-class _StoredAccessToken:
-    token: str
-    client_id: str
-    scopes: list[str]
-    expires_at: float
+# Internal bookkeeping records live in auth_records (imported above) so they can
+# be shared with token_store without a circular import.
 
 
 # Provider -----------------------------------------------------------------
@@ -72,17 +59,21 @@ class MCPOAuthProvider:
 
     clients: list[OAuthClientEntry] = field(default_factory=list)
     api_tokens: list[str] = field(default_factory=list)
+    # Persistence backend for OAuth-issued access/refresh tokens.  Defaults to a
+    # non-persistent in-memory store; pass a SqliteTokenStore to survive restarts.
+    token_store: TokenStore = field(default_factory=InMemoryTokenStore)
 
     # internal stores (keyed by token/code string)
     _clients: dict[str, OAuthClientInformationFull] = field(default_factory=dict, repr=False)
     _auth_codes: dict[str, AuthorizationCode] = field(default_factory=dict, repr=False)
-    _refresh_tokens: dict[str, _StoredRefreshToken] = field(default_factory=dict, repr=False)
-    _access_tokens: dict[str, _StoredAccessToken] = field(default_factory=dict, repr=False)
+    # Static config-defined API tokens are kept in memory (config is their source
+    # of truth) and are never written to the persistent store.
+    _api_tokens: dict[str, _StoredAccessToken] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
         # Seed pre-configured static API tokens as permanent access tokens.
         for token in self.api_tokens:
-            self._access_tokens[token] = _StoredAccessToken(
+            self._api_tokens[token] = _StoredAccessToken(
                 token=token,
                 client_id="api-token",
                 scopes=[],
@@ -90,6 +81,11 @@ class MCPOAuthProvider:
             )
         if self.api_tokens:
             LOG.info("Loaded %d static API token(s)", len(self.api_tokens))
+
+        # Drop any tokens that expired while the server was down.
+        pruned = self.token_store.prune_expired()
+        if pruned:
+            LOG.info("Pruned %d expired persisted token(s)", pruned)
 
         # Seed the pre-configured OAuth clients.
         for entry in self.clients:
@@ -181,18 +177,18 @@ class MCPOAuthProvider:
         refresh = _random_token()
         now = time.time()
 
-        self._access_tokens[access] = _StoredAccessToken(
+        self.token_store.put_access(_StoredAccessToken(
             token=access,
             client_id=client.client_id,
             scopes=authorization_code.scopes,
             expires_at=now + ACCESS_TOKEN_TTL,
-        )
-        self._refresh_tokens[refresh] = _StoredRefreshToken(
+        ))
+        self.token_store.put_refresh(_StoredRefreshToken(
             token=refresh,
             client_id=client.client_id,
             scopes=authorization_code.scopes,
             expires_at=now + REFRESH_TOKEN_TTL,
-        )
+        ))
         LOG.info("Issued access token for client %s", client.client_id)
         return OAuthToken(
             access_token=access,
@@ -209,11 +205,8 @@ class MCPOAuthProvider:
         client: OAuthClientInformationFull,
         refresh_token: str,
     ) -> _StoredRefreshToken | None:
-        rt = self._refresh_tokens.get(refresh_token)
+        rt = self.token_store.get_refresh(refresh_token)
         if rt is None or rt.client_id != client.client_id:
-            return None
-        if time.time() > rt.expires_at:
-            self._refresh_tokens.pop(refresh_token, None)
             return None
         return rt
 
@@ -224,25 +217,25 @@ class MCPOAuthProvider:
         scopes: list[str],
     ) -> OAuthToken:
         # Rotate tokens.
-        self._refresh_tokens.pop(refresh_token.token, None)
+        self.token_store.delete_refresh(refresh_token.token)
 
         access = _random_token()
         new_refresh = _random_token()
         now = time.time()
         effective_scopes = scopes or refresh_token.scopes
 
-        self._access_tokens[access] = _StoredAccessToken(
+        self.token_store.put_access(_StoredAccessToken(
             token=access,
             client_id=client.client_id,
             scopes=effective_scopes,
             expires_at=now + ACCESS_TOKEN_TTL,
-        )
-        self._refresh_tokens[new_refresh] = _StoredRefreshToken(
+        ))
+        self.token_store.put_refresh(_StoredRefreshToken(
             token=new_refresh,
             client_id=client.client_id,
             scopes=effective_scopes,
             expires_at=now + REFRESH_TOKEN_TTL,
-        )
+        ))
         LOG.info("Rotated tokens for client %s", client.client_id)
         return OAuthToken(
             access_token=access,
@@ -255,11 +248,11 @@ class MCPOAuthProvider:
     # -- Access token verification ------------------------------------------
 
     async def load_access_token(self, token: str) -> AccessToken | None:
-        stored = self._access_tokens.get(token)
+        # Static config-defined API tokens take precedence and never expire.
+        stored = self._api_tokens.get(token)
         if stored is None:
-            return None
-        if time.time() > stored.expires_at:
-            self._access_tokens.pop(token, None)
+            stored = self.token_store.get_access(token)
+        if stored is None:
             return None
         return AccessToken(
             token=stored.token,
@@ -275,7 +268,7 @@ class MCPOAuthProvider:
         token: _StoredAccessToken | _StoredRefreshToken,
     ) -> None:
         if isinstance(token, _StoredAccessToken):
-            self._access_tokens.pop(token.token, None)
+            self.token_store.delete_access(token.token)
         elif isinstance(token, _StoredRefreshToken):
-            self._refresh_tokens.pop(token.token, None)
+            self.token_store.delete_refresh(token.token)
         LOG.info("Revoked token for client %s", token.client_id)
