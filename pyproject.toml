@@ -24,10 +24,12 @@ dependencies = [
     "uvicorn>=0.34.0",
     "python-dotenv>=1.0.0",
     "PyJWT>=2.8.0",
+    "google-auth>=2.28",
+    "requests>=2.31",
 ]
 
 [tool.setuptools]
-py-modules = ["main", "auth"]
+py-modules = ["main", "auth", "auth_records", "token_store", "google_oauth"]
 
 [project.urls]
 Homepage = "https://github.com/yourusername/superset-mcp"
