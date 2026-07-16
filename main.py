@@ -293,6 +293,39 @@ MCP_ALLOWED_IPS = os.getenv("MCP_ALLOWED_IPS", "")
 # Trusted proxies: comma-separated IPs
 MCP_TRUSTED_PROXIES = os.getenv("MCP_TRUSTED_PROXIES", "")
 
+# Federated Google (Workspace) login. When client id/secret/domain are all set,
+# interactive clients (Claude, ChatGPT) must sign in with a Google account in
+# the allowed domain before receiving an MCP token. Static API tokens are
+# unaffected. Register a Google Cloud OAuth client whose authorized redirect URI
+# is  <MCP_ISSUER_URL>/auth/google/callback.
+MCP_GOOGLE_CLIENT_ID = os.getenv("MCP_GOOGLE_CLIENT_ID", "")
+MCP_GOOGLE_CLIENT_SECRET = os.getenv("MCP_GOOGLE_CLIENT_SECRET", "")
+MCP_GOOGLE_ALLOWED_DOMAIN = os.getenv("MCP_GOOGLE_ALLOWED_DOMAIN", "")
+# Optional comma-separated allow-list restricting further than the domain check.
+MCP_GOOGLE_ALLOWED_EMAILS = os.getenv("MCP_GOOGLE_ALLOWED_EMAILS", "")
+
+# Path (relative to MCP_ISSUER_URL) Google redirects back to after user login.
+GOOGLE_CALLBACK_PATH = "/auth/google/callback"
+
+# The active OAuth provider and Google config, exposed for the callback route.
+_PROVIDER = None
+_GOOGLE_OAUTH_CONFIG = None
+
+
+def _build_google_oauth_config():
+    """Build a GoogleOAuthConfig from env, or None if federation isn't configured."""
+    if not (MCP_GOOGLE_CLIENT_ID and MCP_GOOGLE_CLIENT_SECRET and MCP_GOOGLE_ALLOWED_DOMAIN):
+        return None
+    from google_oauth import GoogleOAuthConfig
+
+    allowed_emails = [e.strip() for e in MCP_GOOGLE_ALLOWED_EMAILS.split(",") if e.strip()]
+    return GoogleOAuthConfig(
+        client_id=MCP_GOOGLE_CLIENT_ID,
+        client_secret=MCP_GOOGLE_CLIENT_SECRET,
+        allowed_domain=MCP_GOOGLE_ALLOWED_DOMAIN,
+        allowed_emails=allowed_emails,
+    )
+
 
 def _build_mcp_kwargs() -> dict:
     """Build FastMCP constructor kwargs, adding OAuth when using HTTP transport."""
@@ -328,11 +361,29 @@ def _build_mcp_kwargs() -> dict:
 
         token_store = SqliteTokenStore(MCP_TOKEN_DB) if MCP_TOKEN_DB else InMemoryTokenStore()
 
+        google_oauth = _build_google_oauth_config()
+        google_redirect_uri = (
+            MCP_ISSUER_URL.rstrip("/") + GOOGLE_CALLBACK_PATH
+            if google_oauth is not None else None
+        )
+
         provider = MCPOAuthProvider(
             clients=client_entries,
             api_tokens=api_tokens,
             token_store=token_store,
+            google_oauth=google_oauth,
+            google_redirect_uri=google_redirect_uri,
         )
+
+        # Expose for the Google callback route registered in _run_http.
+        global _PROVIDER, _GOOGLE_OAUTH_CONFIG
+        _PROVIDER = provider
+        _GOOGLE_OAUTH_CONFIG = google_oauth
+        if google_oauth is not None:
+            logger.info(
+                "Google federated auth enabled (domain=%s, callback=%s)",
+                google_oauth.allowed_domain, google_redirect_uri,
+            )
         kwargs.update(
             host=MCP_HTTP_HOST,
             port=MCP_HTTP_PORT,
@@ -2914,6 +2965,64 @@ async def _run_http(server: FastMCP, transport: str) -> None:
         starlette_app = server.sse_app()
     else:
         starlette_app = server.streamable_http_app()
+
+    # Register the Google OAuth callback route when federation is enabled.
+    if _GOOGLE_OAUTH_CONFIG is not None:
+        import anyio
+        from starlette.responses import HTMLResponse, RedirectResponse
+        from starlette.routing import Route
+
+        from google_oauth import (
+            GoogleAuthError,
+            check_identity_allowed,
+            exchange_code,
+            verify_id_token,
+        )
+
+        google_cfg = _GOOGLE_OAUTH_CONFIG
+        google_redirect_uri = MCP_ISSUER_URL.rstrip("/") + GOOGLE_CALLBACK_PATH
+
+        def _deny(message: str, status: int) -> HTMLResponse:
+            return HTMLResponse(
+                f"<html><body><h1>Access denied</h1><p>{message}</p></body></html>",
+                status_code=status,
+            )
+
+        async def _google_callback(request: StarletteRequest):
+            if request.query_params.get("error"):
+                return _deny("Google sign-in was cancelled or failed.", 400)
+            code = request.query_params.get("code")
+            state = request.query_params.get("state")
+            if not code or not state:
+                return _deny("Missing authorization code or state.", 400)
+            if _PROVIDER is None:
+                return _deny("Server is not ready.", 503)
+
+            # Google token exchange + verification are blocking (network + crypto);
+            # run them off the event loop.
+            def _verify():
+                id_token = exchange_code(google_cfg, code, google_redirect_uri)
+                claims = verify_id_token(google_cfg, id_token)
+                return check_identity_allowed(claims, google_cfg)
+
+            try:
+                identity = await anyio.to_thread.run_sync(_verify)
+            except GoogleAuthError as exc:
+                logger.warning("Google auth denied: %s", exc)
+                return _deny("Your Google account is not permitted to access this server.", 403)
+            except Exception:  # noqa: BLE001 - defensive: never leak internals to the browser
+                logger.exception("Unexpected error during Google callback")
+                return _deny("Authentication failed. Please try again.", 500)
+
+            try:
+                redirect_url = _PROVIDER.complete_google_authorization(state, identity)
+            except KeyError:
+                return _deny("Your sign-in session expired. Please reconnect and try again.", 400)
+            return RedirectResponse(redirect_url, status_code=302)
+
+        starlette_app.router.routes.append(
+            Route(GOOGLE_CALLBACK_PATH, _google_callback, methods=["GET"])
+        )
 
     # Middleware order (outermost → innermost):
     #   _SecurityHeadersMiddleware → _IPAllowlistMiddleware → _TokenErrorSanitizer → app

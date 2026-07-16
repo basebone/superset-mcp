@@ -126,6 +126,7 @@ class SqliteTokenStore(TokenStore):
             client_id  TEXT NOT NULL,
             scopes     TEXT NOT NULL,
             expires_at REAL NOT NULL,
+            user_email TEXT,
             PRIMARY KEY (token_hash, kind)
         )
     """
@@ -139,62 +140,84 @@ class SqliteTokenStore(TokenStore):
         )
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute(self._SCHEMA)
+        self._migrate()
         try:
             self._path.chmod(0o600)
         except OSError:
             LOG.warning("Could not set 0600 permissions on token DB %s", self._path)
         LOG.info("Persisting OAuth tokens to %s", self._path)
 
+    def _migrate(self) -> None:
+        """Add columns introduced after the initial schema, for existing DBs."""
+        cols = {row[1] for row in self._conn.execute("PRAGMA table_info(oauth_tokens)")}
+        if "user_email" not in cols:
+            self._conn.execute("ALTER TABLE oauth_tokens ADD COLUMN user_email TEXT")
+
     # -- writes -------------------------------------------------------------
 
-    def _put(self, kind: str, token: str, client_id: str, scopes: list[str], expires_at: float) -> None:
+    def _put(
+        self,
+        kind: str,
+        token: str,
+        client_id: str,
+        scopes: list[str],
+        expires_at: float,
+        user_email: str | None,
+    ) -> None:
         with self._lock:
             self._conn.execute(
                 "INSERT OR REPLACE INTO oauth_tokens "
-                "(token_hash, kind, client_id, scopes, expires_at) VALUES (?, ?, ?, ?, ?)",
-                (_hash(token), kind, client_id, " ".join(scopes), expires_at),
+                "(token_hash, kind, client_id, scopes, expires_at, user_email) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (_hash(token), kind, client_id, " ".join(scopes), expires_at, user_email),
             )
 
     def put_access(self, rec: _StoredAccessToken) -> None:
-        self._put("access", rec.token, rec.client_id, rec.scopes, rec.expires_at)
+        self._put("access", rec.token, rec.client_id, rec.scopes, rec.expires_at, rec.user_email)
 
     def put_refresh(self, rec: _StoredRefreshToken) -> None:
-        self._put("refresh", rec.token, rec.client_id, rec.scopes, rec.expires_at)
+        self._put("refresh", rec.token, rec.client_id, rec.scopes, rec.expires_at, rec.user_email)
 
     # -- reads --------------------------------------------------------------
 
-    def _get(self, kind: str, token: str) -> tuple[str, list[str], float] | None:
+    def _get(self, kind: str, token: str) -> tuple[str, list[str], float, str | None] | None:
         h = _hash(token)
         with self._lock:
             row = self._conn.execute(
-                "SELECT client_id, scopes, expires_at FROM oauth_tokens "
+                "SELECT client_id, scopes, expires_at, user_email FROM oauth_tokens "
                 "WHERE token_hash = ? AND kind = ?",
                 (h, kind),
             ).fetchone()
             if row is None:
                 return None
-            client_id, scopes_str, expires_at = row
+            client_id, scopes_str, expires_at, user_email = row
             if time.time() > expires_at:
                 self._conn.execute("DELETE FROM oauth_tokens WHERE token_hash = ?", (h,))
                 return None
         scopes = scopes_str.split() if scopes_str else []
-        return client_id, scopes, expires_at
+        return client_id, scopes, expires_at, user_email
 
     def get_access(self, token: str) -> _StoredAccessToken | None:
         row = self._get("access", token)
         if row is None:
             return None
-        client_id, scopes, expires_at = row
+        client_id, scopes, expires_at, user_email = row
         # The raw token is reconstructed from the caller's input — it is never
         # persisted, only its hash is.
-        return _StoredAccessToken(token=token, client_id=client_id, scopes=scopes, expires_at=expires_at)
+        return _StoredAccessToken(
+            token=token, client_id=client_id, scopes=scopes,
+            expires_at=expires_at, user_email=user_email,
+        )
 
     def get_refresh(self, token: str) -> _StoredRefreshToken | None:
         row = self._get("refresh", token)
         if row is None:
             return None
-        client_id, scopes, expires_at = row
-        return _StoredRefreshToken(token=token, client_id=client_id, scopes=scopes, expires_at=expires_at)
+        client_id, scopes, expires_at, user_email = row
+        return _StoredRefreshToken(
+            token=token, client_id=client_id, scopes=scopes,
+            expires_at=expires_at, user_email=user_email,
+        )
 
     # -- deletes ------------------------------------------------------------
 

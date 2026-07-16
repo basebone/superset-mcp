@@ -38,3 +38,10 @@ typer==0.24.1
 typing-inspection==0.4.2
 typing_extensions==4.15.0
 uvicorn==0.44.0
+# Google-federated user authentication (google-auth) + its HTTP client (requests).
+google-auth==2.56.0
+requests==2.34.2
+pyasn1==0.6.4
+pyasn1-modules==0.4.2
+urllib3==2.7.0
+charset-normalizer==3.4.9
