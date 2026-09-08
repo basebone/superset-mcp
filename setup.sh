@@ -92,17 +92,29 @@ echo "creating $VENV_DIR with $("$PYTHON_BIN" --version)"
 # virtualenv, not the ones the code imports.
 "$VENV_DIR/bin/python" -m pip install --quiet --upgrade pip setuptools wheel
 
-# The lock first, then the project without its dependencies: requirements.txt is what
-# decides the versions, and pyproject.toml's floors are what generated it. Installing the
-# project with its dependencies resolved again would move whatever the lock had pinned.
+# The lock, and only the lock. requirements.txt is what decides the versions, and
+# pyproject.toml's floors are what generated it.
+#
+# The project itself is deliberately not installed. The systemd unit runs
+#   /smsc/var/venvs/supersetmcp/bin/python main.py --transport both
+# with WorkingDirectory=/smsc/src/superset-mcp, so main, auth, token_store and google_oauth
+# are imported from the checkout -- the deployed virtualenv has never held the package,
+# only its dependencies. Installing it editable writes superset_mcp.egg-info into the
+# checkout, and a checkout is not ours to write in: the tree already had a build/ and an
+# egg-info owned by root from an install run as root in April, which made
+# `pip install -e .` fail as sshsync with
+#   error: Cannot update time stamp of directory 'superset_mcp.egg-info'
+# Installing it non-editable would be worse: the code would be copied into site-packages
+# and a deploy updating the checkout would no longer change what runs.
 "$VENV_DIR/bin/python" -m pip install --quiet -r requirements.txt
-"$VENV_DIR/bin/python" -m pip install --quiet --no-deps -e .
 
 # Verified by importing, not by running: the unit starts it with --transport both, so
 # running it here would bind a port and wait. The import resolves every dependency the lock
 # installed, which is what a bad lock breaks -- and google_oauth is named because it is the
 # module whose dependencies used to be missing from the lock in the sibling project.
-"$VENV_DIR/bin/python" -c "import main, auth, token_store, google_oauth; import requests, google.auth; print('superset-mcp imports, google-auth and requests included')"
+#
+# From this directory, because that is how the unit imports them: nothing is installed.
+( cd "$MYDIR" && "$VENV_DIR/bin/python" -c "import main, auth, token_store, google_oauth; import requests, google.auth; print('superset-mcp imports, google-auth and requests included')" )
 
 echo
 echo "done. the unit runs:  $VENV_DIR/bin/python main.py --transport both"
