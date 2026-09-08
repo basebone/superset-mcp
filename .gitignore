@@ -14,3 +14,8 @@ wheels/
 
 # Editor/tool local settings
 .codex/
+.idea/
+.pytest_cache/
+
+# `make lock` mid-flight.
+.lock.tmp

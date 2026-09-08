@@ -1,0 +1,2 @@
+# Test-only, and not dependencies of the server.
+pytest==9.0.3

@@ -79,8 +79,38 @@ npx -y @smithery/cli install @aptro/superset-mcp --client claude
 4. **Install Dependencies**
 
    ```bash
-   uv pip install .
+   ./setup.sh                                        # /smsc/var/venvs/supersetmcp
+   PYTHON_BIN=python3.13 VENV_DIR=./.venv ./setup.sh  # somewhere else
    ```
+
+   `setup.sh` builds the virtualenv and installs into it: the lock first, then the project
+   with `--no-deps`, so `requirements.txt` decides the versions. It removes and rebuilds
+   rather than installing into whatever is there -- `pip install -r` never uninstalls, and
+   the security scanner reads what is installed rather than what is declared. `VENV_KEEP=1`
+   reuses a healthy one while iterating locally, and `./setup.sh --print-venv-dir` says
+   where it goes without building anything.
+
+   On the deploy host it must run as `sshsync`, the user the systemd unit runs as and the
+   owner of every virtualenv under `/smsc/var/venvs`; it refuses otherwise and says so. The
+   interpreter default is 3.10, which is what the deployed virtualenv runs -- not the 3.13
+   in `.python-version`, which is what a developer using `uv` gets.
+
+   `uv pip install .` still works for a developer, but it resolves `pyproject.toml`'s
+   floors afresh instead of installing the lock.
+
+   ### Dependencies and tests
+
+   ```bash
+   make lock                        # regenerate requirements.txt from pyproject.toml
+   make test                        # 33 tests, in python:3.10-slim
+   make test-one T=test_token_store.py
+   ```
+
+   `pyproject.toml` declares floors; `requirements.txt` is the lock they resolved to --
+   never edit it by hand. `requirements-dev.txt` holds pytest, which is not a dependency of
+   the server. `make test` runs `test_google_oauth.py` and `test_token_store.py`;
+   `test_guest_token.py` is left out because `test_guest_token_access` takes an argument no
+   fixture provides, so pytest errors on collecting it.
 
 5. **Install MCP Config for Claude**
 

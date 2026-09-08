@@ -17,7 +17,11 @@ classifiers = [
 dependencies = [
     "fastapi>=0.115.0",
     "httpx>=0.28.0",
-    "mcp[cli]>=1.29.1",
+    # Capped below 2. mcp 2.0 renamed FastMCP to MCPServer, so a resolver free to take
+    # the newest major installs a server that fails at import -- which is what happened to
+    # google-ads-mcp: the lock resolved 2.1.1 and the entry point died before serving a
+    # request.
+    "mcp[cli]>=1.29.1,<2",
     "pydantic>=2.0.0",
     "starlette>=0.36.0",
     "anyio>=4.0",
