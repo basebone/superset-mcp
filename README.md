@@ -318,6 +318,13 @@ This plugin offers the following MCP tools that Claude can use:
 - No credentials are transmitted to Claude or any third parties
 - For production use, consider using more secure authentication methods
 
+## Deployment
+
+Deployed by the autodeployer on superset1: `up supersetmcp` runs `setup.sh`, which
+rebuilds `/smsc/var/venvs/supersetmcp` as root, and then restarts the `supersetmcp`
+service. A failed `setup.sh` stops the deploy rather than restarting the service onto a
+half-built virtualenv.
+
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
