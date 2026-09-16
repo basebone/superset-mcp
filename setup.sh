@@ -111,7 +111,7 @@ echo "creating $VENV_DIR with $("$PYTHON_BIN" --version)"
 # recent pip and the setuptools 59.6.0 the OS ships -- eight advisories up to 8.8 -- because
 # it was created and never upgraded. The scanner reads every package installed in a
 # virtualenv, not the ones the code imports.
-"$VENV_DIR/bin/python" -m pip install --quiet --upgrade pip setuptools wheel
+"$VENV_DIR/bin/python" -m pip install --quiet --no-cache-dir --upgrade pip setuptools wheel
 
 # The lock, and only the lock. requirements.txt is what decides the versions, and
 # pyproject.toml's floors are what generated it.
@@ -127,7 +127,7 @@ echo "creating $VENV_DIR with $("$PYTHON_BIN" --version)"
 #   error: Cannot update time stamp of directory 'superset_mcp.egg-info'
 # Installing it non-editable would be worse: the code would be copied into site-packages
 # and a deploy updating the checkout would no longer change what runs.
-"$VENV_DIR/bin/python" -m pip install --quiet -r requirements.txt
+"$VENV_DIR/bin/python" -m pip install --quiet --no-cache-dir -r requirements.txt
 
 # Verified by importing, not by running: the unit starts it with --transport both, so
 # running it here would bind a port and wait. The import resolves every dependency the lock
