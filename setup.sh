@@ -14,7 +14,12 @@ MYDIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 # 3.10 because that is what the virtualenv deployed on superset1 runs, and pyproject.toml
 # requires only >= 3.10. Note .python-version says 3.13, which is what a developer using
 # uv gets; the lock and this default follow the deployment.
-PYTHON_BIN="${PYTHON_BIN:-python3.10}"
+#
+# The absolute path, not the name: on log2 a hand-built /usr/local/bin/python3.10 sat
+# ahead of the packaged one on PATH and had no sqlite3 module, which is not something to
+# discover after the virtualenv has been deleted. This server keeps its OAuth tokens in a
+# SQLite file too.
+PYTHON_BIN="${PYTHON_BIN:-/usr/bin/python3.10}"
 
 # Flat, no /env, and named supersetmcp while the repository is superset-mcp. Both are what
 # is deployed: the systemd unit in esme.etc names
@@ -29,23 +34,29 @@ if [ "${1:-}" = "--print-venv-dir" ]; then
     exit 0
 fi
 
-# The virtualenv belongs to sshsync. That is the user the deploy runs as -- the up_scripts
-# drop to it with change_user -- the user the systemd unit runs as, and the owner of every
-# other virtualenv under /smsc/var/venvs. Built by anyone else, root especially, the tree
-# cannot be removed by the next deploy, and this script starts by removing it: that is the
-# `rm: Permission denied` that stopped google-ads-mcp's rebuild.
+# The virtualenv belongs to root, the way the other four MCP servers' do. The up script
+# no longer drops to sshsync with change_user -- it installs the systemd unit and restarts
+# the service, which is root's work -- so every deploy arrives here as root and can remove
+# what the last one built. That is the `rm: Permission denied` that stopped
+# google-ads-mcp's rebuild, avoided by having one owner rather than by choosing sshsync.
+#
+# It also means the account the server runs as cannot rewrite the code it executes:
+# sshsync only reads this tree.
 #
 # Checked before anything is deleted, and only when installing under /smsc/var/venvs: a
 # developer naming VENV_DIR is not touching production and is left alone.
 case "$VENV_DIR" in
     /smsc/var/venvs/*)
-        if [ "$(id -un)" != "sshsync" ]; then
-            echo "run this as sshsync, not $(id -un):" >&2
-            echo "  sudo -u sshsync $0" >&2
+        if [ "$(id -un)" != "root" ]; then
+            echo "run this as root, not $(id -un):" >&2
+            echo "  sudo $0" >&2
             exit 1
         fi
         ;;
 esac
+
+# Group- and world-readable, so the sshsync the service runs as can read what root writes.
+umask 022
 
 cd "$MYDIR"
 
@@ -57,6 +68,16 @@ command -v "$PYTHON_BIN" >/dev/null || {
 # Checked before anything is deleted. `python -m venv` reports a missing ensurepip as a
 # non-zero exit from ensurepip and nothing else, so without this the failure arrives after
 # the rebuild below has removed the virtualenv that worked.
+# Checked before anything is deleted, and checked at all because a hand-built interpreter
+# without --enable-loadable-sqlite-extensions has no sqlite3 module, and MCP_TOKEN_DB
+# points this server's OAuth tokens at a SQLite file. Without this the server installs
+# cleanly and fails on the first login.
+"$PYTHON_BIN" -c 'import sqlite3' 2>/dev/null || {
+    echo "$PYTHON_BIN has no sqlite3 module, which the OAuth token database needs." >&2
+    echo "On this host /usr/bin/python3.10 is the packaged one and has it." >&2
+    exit 1
+}
+
 "$PYTHON_BIN" -c 'import ensurepip' 2>/dev/null || {
     echo "$PYTHON_BIN has no ensurepip, so it cannot create a virtualenv with pip in it." >&2
     echo "On Debian and Ubuntu that is the python3.x-venv package." >&2
