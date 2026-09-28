@@ -2,6 +2,7 @@ from typing import (
     Any,
     Dict,
     List,
+    Mapping,
     Optional,
     AsyncIterator,
     Callable,
@@ -10,20 +11,20 @@ from typing import (
     Union,
 )
 import argparse
-import ipaddress
 import os
 import httpx
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from functools import wraps
-import inspect
 from threading import Thread
 import webbrowser
-import uvicorn
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
 from mcp.server.fastmcp import FastMCP, Context
 from dotenv import load_dotenv
+from esme_mcp.config import HTTPConfig
+from esme_mcp.serving import auth_kwargs, build_oauth_provider, configure_logging, current_user, serve
+
+from http_config_env import read_http_config
 import json
 import logging
 import jwt
@@ -275,134 +276,74 @@ async def superset_lifespan(server: FastMCP) -> AsyncIterator[SupersetContext]:
 # HTTP transport configuration (from environment variables)
 # ---------------------------------------------------------------------------
 MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "stdio")  # stdio | streamable-http | sse | both
-MCP_HTTP_HOST = os.getenv("MCP_HTTP_HOST", "0.0.0.0")
-MCP_HTTP_PORT = int(os.getenv("MCP_HTTP_PORT", "8044"))
-MCP_ISSUER_URL = os.getenv("MCP_ISSUER_URL", "http://localhost:8044")
-MCP_TLS_CERTFILE = os.getenv("MCP_TLS_CERTFILE")
-MCP_TLS_KEYFILE = os.getenv("MCP_TLS_KEYFILE")
-# OAuth clients: comma-separated "id:secret" pairs
-# e.g. "claude-ai:secret1,chatgpt:secret2"
-MCP_OAUTH_CLIENTS = os.getenv("MCP_OAUTH_CLIENTS", "")
-# Static API tokens: comma-separated
-MCP_API_TOKENS = os.getenv("MCP_API_TOKENS", "")
-# Optional SQLite file for persisting OAuth-issued tokens across restarts.
-# Omit to keep tokens in memory only (they are lost on restart).
-MCP_TOKEN_DB = os.getenv("MCP_TOKEN_DB", "")
-# IP allowlist: comma-separated CIDRs
-MCP_ALLOWED_IPS = os.getenv("MCP_ALLOWED_IPS", "")
-# Trusted proxies: comma-separated IPs
-MCP_TRUSTED_PROXIES = os.getenv("MCP_TRUSTED_PROXIES", "")
+HTTP_TRANSPORTS = ("streamable-http", "sse", "both")
 
-# Federated Google (Workspace) login. When client id/secret/domain are all set,
-# interactive clients (Claude, ChatGPT) must sign in with a Google account in
-# the allowed domain before receiving an MCP token. Static API tokens are
-# unaffected. Register a Google Cloud OAuth client whose authorized redirect URI
-# is  <MCP_ISSUER_URL>/auth/google/callback.
-MCP_GOOGLE_CLIENT_ID = os.getenv("MCP_GOOGLE_CLIENT_ID", "")
-MCP_GOOGLE_CLIENT_SECRET = os.getenv("MCP_GOOGLE_CLIENT_SECRET", "")
-MCP_GOOGLE_ALLOWED_DOMAIN = os.getenv("MCP_GOOGLE_ALLOWED_DOMAIN", "")
-# Optional comma-separated allow-list restricting further than the domain check.
-MCP_GOOGLE_ALLOWED_EMAILS = os.getenv("MCP_GOOGLE_ALLOWED_EMAILS", "")
-
-# Path (relative to MCP_ISSUER_URL) Google redirects back to after user login.
-GOOGLE_CALLBACK_PATH = "/auth/google/callback"
-
-# The active OAuth provider and Google config, exposed for the callback route.
-_PROVIDER = None
-_GOOGLE_OAUTH_CONFIG = None
+# The authorization server, the token store, the Google login, the revalidation and the
+# whole HTTP layer are esme_mcp's: this file decides what the server serves, not who is
+# let in. The MCP_* variables are read into esme_mcp's HTTPConfig by http_config_env.
+#
+# The name tells this server's registered clients apart from the other MCP servers' on
+# the authorization screen.
+SERVER_NAME = "superset-mcp"
 
 
-def _build_google_oauth_config():
-    """Build a GoogleOAuthConfig from env, or None if federation isn't configured."""
-    if not (MCP_GOOGLE_CLIENT_ID and MCP_GOOGLE_CLIENT_SECRET and MCP_GOOGLE_ALLOWED_DOMAIN):
-        return None
-    from google_oauth import GoogleOAuthConfig
-
-    allowed_emails = [e.strip() for e in MCP_GOOGLE_ALLOWED_EMAILS.split(",") if e.strip()]
-    return GoogleOAuthConfig(
-        client_id=MCP_GOOGLE_CLIENT_ID,
-        client_secret=MCP_GOOGLE_CLIENT_SECRET,
-        allowed_domain=MCP_GOOGLE_ALLOWED_DOMAIN,
-        allowed_emails=allowed_emails,
-    )
+def read_http_config_or_exit(environ: Mapping[str, str]) -> HTTPConfig:
+    """The HTTP and OAuth settings, or an exit naming what is wrong with them."""
+    try:
+        return read_http_config(environ)
+    except ValueError as exc:
+        raise SystemExit(f"Invalid MCP_* configuration: {exc}") from None
 
 
-def _build_mcp_kwargs() -> dict:
-    """Build FastMCP constructor kwargs, adding OAuth when using HTTP transport."""
+def _build_mcp_kwargs(http_config: Optional[HTTPConfig]) -> dict:
+    """Build FastMCP constructor kwargs, adding OAuth when serving over HTTP."""
     kwargs: Dict[str, Any] = {
         "name": "superset",
         "lifespan": superset_lifespan,
         "dependencies": ["fastapi", "uvicorn", "python-dotenv", "httpx", "PyJWT"],
     }
 
-    transport = os.getenv("MCP_TRANSPORT", "stdio")
-    if transport in ("streamable-http", "sse", "both"):
-        from auth import MCPOAuthProvider, OAuthClientEntry
-        from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
-
-        # Parse OAuth clients from env
-        client_entries = []
-        if MCP_OAUTH_CLIENTS:
-            for pair in MCP_OAUTH_CLIENTS.split(","):
-                pair = pair.strip()
-                if ":" in pair:
-                    cid, csec = pair.split(":", 1)
-                    client_entries.append(OAuthClientEntry(client_id=cid.strip(), client_secret=csec.strip()))
-
-        if not client_entries:
-            raise SystemExit(
-                "HTTP transport requires at least one OAuth client. "
-                "Set MCP_OAUTH_CLIENTS='client_id:client_secret' in environment."
-            )
-
-        api_tokens = [t.strip() for t in MCP_API_TOKENS.split(",") if t.strip()] if MCP_API_TOKENS else []
-
-        from token_store import InMemoryTokenStore, SqliteTokenStore
-
-        token_store = SqliteTokenStore(MCP_TOKEN_DB) if MCP_TOKEN_DB else InMemoryTokenStore()
-
-        google_oauth = _build_google_oauth_config()
-        google_redirect_uri = (
-            MCP_ISSUER_URL.rstrip("/") + GOOGLE_CALLBACK_PATH
-            if google_oauth is not None else None
+    if http_config is not None:
+        provider = build_oauth_provider(http_config, server_name=SERVER_NAME)
+        kwargs.update(auth_kwargs(http_config, provider))
+        logger.info(
+            "HTTP transport configured on %s:%s (OAuth clients: %d)",
+            http_config.host,
+            http_config.port,
+            len(http_config.clients),
         )
-
-        provider = MCPOAuthProvider(
-            clients=client_entries,
-            api_tokens=api_tokens,
-            token_store=token_store,
-            google_oauth=google_oauth,
-            google_redirect_uri=google_redirect_uri,
-        )
-
-        # Expose for the Google callback route registered in _run_http.
-        global _PROVIDER, _GOOGLE_OAUTH_CONFIG
-        _PROVIDER = provider
-        _GOOGLE_OAUTH_CONFIG = google_oauth
-        if google_oauth is not None:
-            logger.info(
-                "Google federated auth enabled (domain=%s, callback=%s)",
-                google_oauth.allowed_domain, google_redirect_uri,
-            )
-        kwargs.update(
-            host=MCP_HTTP_HOST,
-            port=MCP_HTTP_PORT,
-            auth_server_provider=provider,
-            auth=AuthSettings(
-                issuer_url=MCP_ISSUER_URL,
-                resource_server_url=MCP_ISSUER_URL,
-                client_registration_options=ClientRegistrationOptions(enabled=False),
-                revocation_options=RevocationOptions(enabled=True),
-            ),
-        )
-        logger.info("HTTP transport configured on %s:%s (OAuth clients: %d)",
-                     MCP_HTTP_HOST, MCP_HTTP_PORT, len(client_entries))
 
     return kwargs
 
 
+# None for stdio, where there is no HTTP layer and no authorization server.
+HTTP_CONFIG: Optional[HTTPConfig] = (
+    read_http_config_or_exit(os.environ) if MCP_TRANSPORT in HTTP_TRANSPORTS else None
+)
+
 # Initialize FastMCP server with lifespan and dependencies
-mcp = FastMCP(**_build_mcp_kwargs())
+mcp = FastMCP(**_build_mcp_kwargs(HTTP_CONFIG))
+
+
+def audited_tool(**tool_options: Any) -> Callable[[Callable[..., Awaitable[Any]]], Callable[..., Awaitable[Any]]]:
+    """Register a tool that writes an audit line, naming the caller, on every MCP call.
+
+    The audited wrapper is what FastMCP registers, and the undecorated function is what
+    the module name keeps. Tools here call each other directly --
+    with_auto_refresh calls superset_auth_refresh_token -- and those internal calls are
+    not requests from anybody, so they must not appear in the audit as if they were.
+    """
+
+    def register(tool_function: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
+        @wraps(tool_function)
+        async def audited_tool_function(*args, **kwargs):
+            logger.info("AUDIT user=%s tool=%s", current_user(), tool_function.__name__)
+            return await tool_function(*args, **kwargs)
+
+        mcp.tool(**tool_options)(audited_tool_function)
+        return tool_function
+
+    return register
 
 # Type variables for generic function annotations
 T = TypeVar("T")
@@ -730,7 +671,7 @@ async def add_current_user_as_owner(
 # ===== Authentication Tools =====
 
 
-@mcp.tool()
+@audited_tool()
 @handle_api_errors
 async def superset_auth_check_token_validity(ctx: Context) -> Dict[str, Any]:
     """
@@ -763,7 +704,7 @@ async def superset_auth_check_token_validity(ctx: Context) -> Dict[str, Any]:
         return {"valid": False, "error": str(e)}
 
 
-@mcp.tool()
+@audited_tool()
 @handle_api_errors
 async def superset_auth_refresh_token(ctx: Context) -> Dict[str, Any]:
     """
@@ -807,7 +748,7 @@ async def superset_auth_refresh_token(ctx: Context) -> Dict[str, Any]:
         return {"error": f"Error refreshing token: {str(e)}"}
 
 
-@mcp.tool()
+@audited_tool()
 @handle_api_errors
 async def superset_auth_authenticate_user(
     ctx: Context,
@@ -899,7 +840,7 @@ async def superset_auth_authenticate_user(
 # ===== Dashboard Tools =====
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_dashboard_list(ctx: Context) -> Dict[str, Any]:
@@ -915,7 +856,7 @@ async def superset_dashboard_list(ctx: Context) -> Dict[str, Any]:
     return await make_api_request(ctx, "get", "/api/v1/dashboard/")
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_dashboard_get_by_id(
@@ -936,7 +877,7 @@ async def superset_dashboard_get_by_id(
     return await make_api_request(ctx, "get", f"/api/v1/dashboard/{dashboard_id}")
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_dashboard_create(
@@ -966,7 +907,7 @@ async def superset_dashboard_create(
     return await make_api_request(ctx, "post", "/api/v1/dashboard/", data=payload)
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_dashboard_update(
@@ -996,7 +937,7 @@ async def superset_dashboard_update(
     )
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_dashboard_delete(ctx: Context, dashboard_id: int) -> Dict[str, Any]:
@@ -1032,7 +973,7 @@ async def superset_dashboard_delete(ctx: Context, dashboard_id: int) -> Dict[str
 # ===== Chart Tools =====
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_chart_list(ctx: Context) -> Dict[str, Any]:
@@ -1048,7 +989,7 @@ async def superset_chart_list(ctx: Context) -> Dict[str, Any]:
     return await make_api_request(ctx, "get", "/api/v1/chart/")
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_chart_get_by_id(ctx: Context, chart_id: int) -> Dict[str, Any]:
@@ -1067,7 +1008,7 @@ async def superset_chart_get_by_id(ctx: Context, chart_id: int) -> Dict[str, Any
     return await make_api_request(ctx, "get", f"/api/v1/chart/{chart_id}")
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_chart_create(
@@ -1108,7 +1049,7 @@ async def superset_chart_create(
     return await make_api_request(ctx, "post", "/api/v1/chart/", data=payload)
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_chart_update(
@@ -1136,7 +1077,7 @@ async def superset_chart_update(
     return await make_api_request(ctx, "put", f"/api/v1/chart/{chart_id}", data=data)
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_chart_delete(ctx: Context, chart_id: int) -> Dict[str, Any]:
@@ -1169,7 +1110,7 @@ async def superset_chart_delete(ctx: Context, chart_id: int) -> Dict[str, Any]:
 # ===== Database Tools =====
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_database_list(ctx: Context) -> Dict[str, Any]:
@@ -1185,7 +1126,7 @@ async def superset_database_list(ctx: Context) -> Dict[str, Any]:
     return await make_api_request(ctx, "get", "/api/v1/database/")
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_database_get_by_id(ctx: Context, database_id: int) -> Dict[str, Any]:
@@ -1204,7 +1145,7 @@ async def superset_database_get_by_id(ctx: Context, database_id: int) -> Dict[st
     return await make_api_request(ctx, "get", f"/api/v1/database/{database_id}")
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_database_create(
@@ -1259,7 +1200,7 @@ async def superset_database_create(
     return await make_api_request(ctx, "post", "/api/v1/database/", data=payload)
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_database_get_tables(
@@ -1280,7 +1221,7 @@ async def superset_database_get_tables(
     return await make_api_request(ctx, "get", f"/api/v1/database/{database_id}/tables/")
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_database_schemas(ctx: Context, database_id: int) -> Dict[str, Any]:
@@ -1301,7 +1242,7 @@ async def superset_database_schemas(ctx: Context, database_id: int) -> Dict[str,
     )
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_database_test_connection(
@@ -1324,7 +1265,7 @@ async def superset_database_test_connection(
     )
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_database_update(
@@ -1354,7 +1295,7 @@ async def superset_database_update(
     )
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_database_delete(ctx: Context, database_id: int) -> Dict[str, Any]:
@@ -1384,7 +1325,7 @@ async def superset_database_delete(ctx: Context, database_id: int) -> Dict[str, 
     return response
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_database_get_catalogs(
@@ -1407,7 +1348,7 @@ async def superset_database_get_catalogs(
     )
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_database_get_connection(
@@ -1430,7 +1371,7 @@ async def superset_database_get_connection(
     )
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_database_get_function_names(
@@ -1453,7 +1394,7 @@ async def superset_database_get_function_names(
     )
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_database_get_related_objects(
@@ -1476,7 +1417,7 @@ async def superset_database_get_related_objects(
     )
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_database_validate_sql(
@@ -1501,7 +1442,7 @@ async def superset_database_validate_sql(
     )
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_database_validate_parameters(
@@ -1527,7 +1468,7 @@ async def superset_database_validate_parameters(
 # ===== Dataset Tools =====
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_dataset_list(ctx: Context) -> Dict[str, Any]:
@@ -1543,7 +1484,7 @@ async def superset_dataset_list(ctx: Context) -> Dict[str, Any]:
     return await make_api_request(ctx, "get", "/api/v1/dataset/")
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_dataset_get_by_id(ctx: Context, dataset_id: int) -> Dict[str, Any]:
@@ -1562,7 +1503,7 @@ async def superset_dataset_get_by_id(ctx: Context, dataset_id: int) -> Dict[str,
     return await make_api_request(ctx, "get", f"/api/v1/dataset/{dataset_id}")
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_dataset_create(
@@ -1613,7 +1554,7 @@ async def superset_dataset_create(
     return await make_api_request(ctx, "post", "/api/v1/dataset/", data=payload)
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_dataset_delete(ctx: Context, dataset_id: int) -> Dict[str, Any]:
@@ -1644,7 +1585,7 @@ async def superset_dataset_delete(ctx: Context, dataset_id: int) -> Dict[str, An
     return response
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_dataset_update(
@@ -1721,7 +1662,7 @@ async def superset_dataset_update(
 # ===== SQL Lab Tools =====
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_sqllab_execute_query(
@@ -1757,7 +1698,7 @@ async def superset_sqllab_execute_query(
     return await make_api_request(ctx, "post", "/api/v1/sqllab/execute/", data=payload)
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_sqllab_get_saved_queries(ctx: Context) -> Dict[str, Any]:
@@ -1773,7 +1714,7 @@ async def superset_sqllab_get_saved_queries(ctx: Context) -> Dict[str, Any]:
     return await make_api_request(ctx, "get", "/api/v1/saved_query/")
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_sqllab_format_sql(ctx: Context, sql: str) -> Dict[str, Any]:
@@ -1795,7 +1736,7 @@ async def superset_sqllab_format_sql(ctx: Context, sql: str) -> Dict[str, Any]:
     )
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_sqllab_get_results(ctx: Context, key: str) -> Dict[str, Any]:
@@ -1816,7 +1757,7 @@ async def superset_sqllab_get_results(ctx: Context, key: str) -> Dict[str, Any]:
     )
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_sqllab_estimate_query_cost(
@@ -1847,7 +1788,7 @@ async def superset_sqllab_estimate_query_cost(
     return await make_api_request(ctx, "post", "/api/v1/sqllab/estimate", data=payload)
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_sqllab_export_query_results(
@@ -1881,7 +1822,7 @@ async def superset_sqllab_export_query_results(
         return {"error": f"Error exporting query results: {str(e)}"}
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_sqllab_get_bootstrap_data(ctx: Context) -> Dict[str, Any]:
@@ -1900,7 +1841,7 @@ async def superset_sqllab_get_bootstrap_data(ctx: Context) -> Dict[str, Any]:
 # ===== Saved Query Tools =====
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_saved_query_get_by_id(ctx: Context, query_id: int) -> Dict[str, Any]:
@@ -1919,7 +1860,7 @@ async def superset_saved_query_get_by_id(ctx: Context, query_id: int) -> Dict[st
     return await make_api_request(ctx, "get", f"/api/v1/saved_query/{query_id}")
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_saved_query_create(
@@ -1948,7 +1889,7 @@ async def superset_saved_query_create(
 # ===== Query Tools =====
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_query_stop(ctx: Context, client_id: str) -> Dict[str, Any]:
@@ -1968,7 +1909,7 @@ async def superset_query_stop(ctx: Context, client_id: str) -> Dict[str, Any]:
     return await make_api_request(ctx, "post", "/api/v1/query/stop", data=payload)
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_query_list(ctx: Context) -> Dict[str, Any]:
@@ -1984,7 +1925,7 @@ async def superset_query_list(ctx: Context) -> Dict[str, Any]:
     return await make_api_request(ctx, "get", "/api/v1/query/")
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_query_get_by_id(ctx: Context, query_id: int) -> Dict[str, Any]:
@@ -2006,7 +1947,7 @@ async def superset_query_get_by_id(ctx: Context, query_id: int) -> Dict[str, Any
 # ===== Activity and User Tools =====
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_activity_get_recent(ctx: Context) -> Dict[str, Any]:
@@ -2022,7 +1963,7 @@ async def superset_activity_get_recent(ctx: Context) -> Dict[str, Any]:
     return await make_api_request(ctx, "get", "/api/v1/log/recent_activity/")
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_user_get_current(ctx: Context) -> Dict[str, Any]:
@@ -2038,7 +1979,7 @@ async def superset_user_get_current(ctx: Context) -> Dict[str, Any]:
     return await make_api_request(ctx, "get", "/api/v1/me/")
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_user_get_roles(ctx: Context) -> Dict[str, Any]:
@@ -2057,7 +1998,7 @@ async def superset_user_get_roles(ctx: Context) -> Dict[str, Any]:
 # ===== Tag Tools =====
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_tag_list(ctx: Context) -> Dict[str, Any]:
@@ -2073,7 +2014,7 @@ async def superset_tag_list(ctx: Context) -> Dict[str, Any]:
     return await make_api_request(ctx, "get", "/api/v1/tag/")
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_tag_create(ctx: Context, name: str) -> Dict[str, Any]:
@@ -2093,7 +2034,7 @@ async def superset_tag_create(ctx: Context, name: str) -> Dict[str, Any]:
     return await make_api_request(ctx, "post", "/api/v1/tag/", data=payload)
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_tag_get_by_id(ctx: Context, tag_id: int) -> Dict[str, Any]:
@@ -2112,7 +2053,7 @@ async def superset_tag_get_by_id(ctx: Context, tag_id: int) -> Dict[str, Any]:
     return await make_api_request(ctx, "get", f"/api/v1/tag/{tag_id}")
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_tag_objects(ctx: Context) -> Dict[str, Any]:
@@ -2128,7 +2069,7 @@ async def superset_tag_objects(ctx: Context) -> Dict[str, Any]:
     return await make_api_request(ctx, "get", "/api/v1/tag/get_objects/")
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_tag_delete(ctx: Context, tag_id: int) -> Dict[str, Any]:
@@ -2158,7 +2099,7 @@ async def superset_tag_delete(ctx: Context, tag_id: int) -> Dict[str, Any]:
     return response
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_tag_object_add(
@@ -2210,7 +2151,7 @@ async def superset_tag_object_add(
     )
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_tag_object_remove(
@@ -2268,7 +2209,7 @@ async def superset_tag_object_remove(
 # ===== Explore Tools =====
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_explore_form_data_create(
@@ -2291,7 +2232,7 @@ async def superset_explore_form_data_create(
     )
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_explore_form_data_get(ctx: Context, key: str) -> Dict[str, Any]:
@@ -2310,7 +2251,7 @@ async def superset_explore_form_data_get(ctx: Context, key: str) -> Dict[str, An
     return await make_api_request(ctx, "get", f"/api/v1/explore/form_data/{key}")
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_explore_permalink_create(
@@ -2331,7 +2272,7 @@ async def superset_explore_permalink_create(
     return await make_api_request(ctx, "post", "/api/v1/explore/permalink", data=state)
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_explore_permalink_get(ctx: Context, key: str) -> Dict[str, Any]:
@@ -2353,7 +2294,7 @@ async def superset_explore_permalink_get(ctx: Context, key: str) -> Dict[str, An
 # ===== Menu Tools =====
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_menu_get(ctx: Context) -> Dict[str, Any]:
@@ -2372,7 +2313,7 @@ async def superset_menu_get(ctx: Context) -> Dict[str, Any]:
 # ===== Guest Token Tools =====
 
 
-@mcp.tool()
+@audited_tool()
 @handle_api_errors
 async def superset_guest_token_generate(
     ctx: Context,
@@ -2441,7 +2382,7 @@ async def superset_guest_token_generate(
 # ===== Screenshot Tools =====
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_dashboard_cache_screenshot(
@@ -2469,7 +2410,7 @@ async def superset_dashboard_cache_screenshot(
     )
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_dashboard_get_screenshot(
@@ -2515,7 +2456,7 @@ async def superset_dashboard_get_screenshot(
         return {"error": f"Error retrieving screenshot: {str(e)}"}
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_dashboard_get_thumbnail(
@@ -2560,7 +2501,7 @@ async def superset_dashboard_get_thumbnail(
         return {"error": f"Error retrieving thumbnail: {str(e)}"}
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_chart_export_image(
@@ -2608,7 +2549,7 @@ async def superset_chart_export_image(
 # ===== Configuration Tools =====
 
 
-@mcp.tool()
+@audited_tool()
 @handle_api_errors
 async def superset_config_get_base_url(ctx: Context) -> Dict[str, Any]:
     """
@@ -2634,7 +2575,7 @@ async def superset_config_get_base_url(ctx: Context) -> Dict[str, Any]:
 # ===== Advanced Data Type Tools =====
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_advanced_data_type_convert(
@@ -2663,7 +2604,7 @@ async def superset_advanced_data_type_convert(
     )
 
 
-@mcp.tool()
+@audited_tool()
 @requires_auth
 @handle_api_errors
 async def superset_advanced_data_type_list(ctx: Context) -> Dict[str, Any]:
@@ -2679,378 +2620,17 @@ async def superset_advanced_data_type_list(ctx: Context) -> Dict[str, Any]:
     return await make_api_request(ctx, "get", "/api/v1/advanced_data_type/types")
 
 
-def _get_client_ip(request, trusted_proxies: set) -> str:
-    """Resolve the real client IP, respecting X-Real-IP / X-Forwarded-For from trusted proxies."""
-    import ipaddress as _ipaddress
+async def check_superset_answers() -> None:
+    """What /health means for this server: Superset answers its own health check.
 
-    peer_ip = request.client.host if request.client else "unknown"
-    if peer_ip in trusted_proxies:
-        # Prefer X-Real-IP (single trusted value set by HAProxy).
-        real_ip = request.headers.get("x-real-ip", "").strip()
-        if real_ip:
-            try:
-                _ipaddress.ip_address(real_ip)
-                return real_ip
-            except ValueError:
-                pass
-
-        # Fall back to first entry of X-Forwarded-For.
-        xff = request.headers.get("x-forwarded-for", "")
-        if xff:
-            candidate = xff.split(",")[0].strip()
-            try:
-                _ipaddress.ip_address(candidate)
-                return candidate
-            except ValueError:
-                pass
-    return peer_ip
-
-
-async def _run_http(server: FastMCP, transport: str) -> None:
-    """Run HTTP-based transport with optional TLS, IP allowlist, and health check."""
-    import json as _json
-
-    from starlette.middleware.base import BaseHTTPMiddleware
-    from starlette.requests import Request as StarletteRequest
-    from starlette.responses import JSONResponse, PlainTextResponse, Response
-
-    trusted_proxies = set(t.strip() for t in MCP_TRUSTED_PROXIES.split(",") if t.strip())
-
-    # Build IP allowlist
-    allow_nets = None
-    if MCP_ALLOWED_IPS:
-        allow_nets = [ipaddress.ip_network(e.strip(), strict=False)
-                      for e in MCP_ALLOWED_IPS.split(",") if e.strip()]
-        logger.info("IP allowlist active: %s", [str(n) for n in allow_nets])
-
-    async def _health_check(request: StarletteRequest) -> JSONResponse:
-        """Unauthenticated health check — tests Superset API connectivity.
-
-        The reason for a failure goes to the log and never into the answer: this route
-        needs no token, and an exception's text names hosts and addresses.
-        """
-        try:
-            async with httpx.AsyncClient(base_url=SUPERSET_BASE_URL, timeout=10.0) as client:
-                resp = await client.get("/health")
-                if resp.status_code == 200:
-                    return JSONResponse({"status": "ok"}, status_code=200)
-                logger.error("Health check failed: Superset returned %s", resp.status_code)
-                return JSONResponse({"status": "error"}, status_code=503)
-        except Exception as exc:
-            logger.error("Health check failed: %s", exc)
-            return JSONResponse({"status": "error"}, status_code=503)
-
-    class _IPAllowlistMiddleware(BaseHTTPMiddleware):
-        async def dispatch(self, request: StarletteRequest, call_next):
-            # Health check — bypass IP allowlist and auth.
-            if request.url.path == "/health":
-                return await _health_check(request)
-            if allow_nets is not None:
-                client_ip = _get_client_ip(request, trusted_proxies)
-                try:
-                    addr = ipaddress.ip_address(client_ip)
-                except ValueError:
-                    logger.warning("Rejected request with unparseable IP: %s", client_ip)
-                    return PlainTextResponse("Forbidden", status_code=403)
-                if not any(addr in net for net in allow_nets):
-                    logger.warning("Rejected request from %s (not in allowlist)", client_ip)
-                    return PlainTextResponse("Forbidden", status_code=403)
-            return await call_next(request)
-
-    # Paths where the MCP SDK auth middleware would reject OPTIONS preflight.
-    _AUTH_PROTECTED_PATHS = {"/mcp", "/sse", "/messages", "/messages/"}
-    # Public metadata paths where CORS should always be wildcard.
-    _WELLKNOWN_PATHS = {
-        "/.well-known/oauth-authorization-server",
-        "/.well-known/oauth-protected-resource",
-    }
-
-    class _TokenErrorSanitizer:
-        """Raw ASGI middleware that sanitizes OAuth error details on auth endpoints.
-
-        Prevents Pydantic validation internals and client-enumeration details
-        from leaking in error responses.  Operates at the ASGI protocol level
-        because Starlette's BaseHTTPMiddleware cannot reliably intercept
-        response bodies.
-        """
-
-        _TOKEN_PATHS = frozenset({"/token", "/revoke"})
-        _AUTHORIZE_PATH = "/authorize"
-        _SANITIZE_PATHS = _TOKEN_PATHS | {_AUTHORIZE_PATH}
-        _SUPPORTED_GRANTS = frozenset({"authorization_code", "refresh_token", "client_credentials"})
-        _PYDANTIC_MARKERS = ("discriminator", "Input tag", "expected tags", "extract tag", "validation error")
-        _ENUMERATE_MARKERS = ("not found", "not registered")
-
-        def __init__(self, app):
-            self.app = app
-
-        async def __call__(self, scope, receive, send):
-            if scope["type"] != "http":
-                await self.app(scope, receive, send)
-                return
-
-            path = scope.get("path", "")
-            method = scope.get("method", "GET")
-            if path not in self._SANITIZE_PATHS:
-                await self.app(scope, receive, send)
-                return
-
-            # Token/revoke require POST; authorize allows GET and POST.
-            if path in self._TOKEN_PATHS and method != "POST":
-                await self.app(scope, receive, send)
-                return
-            if path == self._AUTHORIZE_PATH and method not in ("GET", "POST"):
-                await self.app(scope, receive, send)
-                return
-
-            # Buffer the incoming request body so we can derive grant_type later.
-            request_body_parts: list[bytes] = []
-
-            async def capture_receive():
-                message = await receive()
-                if message["type"] == "http.request":
-                    request_body_parts.append(message.get("body", b""))
-                return message
-
-            # Buffer the response to inspect for Pydantic leakage.
-            status_code = 200
-            response_headers: list[tuple[bytes, bytes]] = []
-            body_chunks: list[bytes] = []
-
-            async def capture_send(message):
-                nonlocal status_code, response_headers
-
-                if message["type"] == "http.response.start":
-                    status_code = message.get("status", 200)
-                    response_headers = list(message.get("headers", []))
-                    return  # Hold — wait for the full body before forwarding.
-
-                if message["type"] != "http.response.body":
-                    await send(message)
-                    return
-
-                body_chunks.append(message.get("body", b""))
-                if message.get("more_body", False):
-                    return  # Keep accumulating.
-
-                # --- Full response received ---
-                full_body = b"".join(body_chunks)
-
-                if status_code < 400:
-                    # Success — forward unchanged.
-                    await send({"type": "http.response.start", "status": status_code, "headers": response_headers})
-                    await send({"type": "http.response.body", "body": full_body})
-                    return
-
-                # 4xx/5xx — check if the body needs sanitization.
-                needs_sanitize = True
-                try:
-                    parsed = _json.loads(full_body)
-                    if isinstance(parsed, dict) and "error" in parsed:
-                        desc = str(parsed.get("error_description", ""))
-                        if path == self._AUTHORIZE_PATH:
-                            # Prevent client ID enumeration: genericize if
-                            # the description reveals client/redirect info.
-                            desc_lower = desc.lower()
-                            if any(m in desc_lower for m in self._ENUMERATE_MARKERS) or \
-                               any(m in desc for m in self._PYDANTIC_MARKERS):
-                                needs_sanitize = True
-                            else:
-                                needs_sanitize = False
-                        else:
-                            # Token/revoke: only sanitize Pydantic leakage.
-                            if not any(m in desc for m in self._PYDANTIC_MARKERS):
-                                needs_sanitize = False
-                except (ValueError, UnicodeDecodeError):
-                    pass
-
-                if not needs_sanitize:
-                    await send({"type": "http.response.start", "status": status_code, "headers": response_headers})
-                    await send({"type": "http.response.body", "body": full_body})
-                    return
-
-                # Build the safe replacement error body.
-                if path == self._AUTHORIZE_PATH:
-                    error_code, error_desc = "invalid_request", "The authorization request is invalid"
-                else:
-                    error_code, error_desc = self._rfc6749_error(request_body_parts)
-                replacement = _json.dumps({"error": error_code, "error_description": error_desc}).encode("utf-8")
-
-                new_headers = [
-                    (k, v) for k, v in response_headers
-                    if k.lower() not in (b"content-length", b"content-type")
-                ]
-                new_headers.append((b"content-type", b"application/json"))
-                new_headers.append((b"content-length", str(len(replacement)).encode()))
-
-                await send({"type": "http.response.start", "status": 400, "headers": new_headers})
-                await send({"type": "http.response.body", "body": replacement})
-
-            await self.app(scope, capture_receive, capture_send)
-
-        @classmethod
-        def _rfc6749_error(cls, request_body_parts: list[bytes]) -> tuple[str, str]:
-            """Derive an RFC 6749 error code and description from the buffered request body."""
-            from urllib.parse import parse_qs
-
-            raw = b"".join(request_body_parts).decode("utf-8", errors="replace")
-            params = parse_qs(raw)
-            grant_type = (params.get("grant_type") or [None])[0]
-
-            if grant_type is None:
-                return "invalid_request", "Missing required parameter: grant_type"
-            if grant_type not in cls._SUPPORTED_GRANTS:
-                safe_gt = "".join(c for c in grant_type[:64] if c.isalnum() or c == "_")
-                return "unsupported_grant_type", f"Grant type '{safe_gt}' is not supported"
-            return "invalid_request", "The request is malformed or missing required parameters"
-
-    class _SecurityHeadersMiddleware(BaseHTTPMiddleware):
-        """Outermost middleware: CORS preflight and security headers."""
-        async def dispatch(self, request: StarletteRequest, call_next):
-            path = request.url.path
-
-            # --- CORS preflight: respond before auth middleware can reject it ---
-            if request.method == "OPTIONS" and path in _AUTH_PROTECTED_PATHS:
-                origin = request.headers.get("origin", "*")
-                return Response(
-                    status_code=204,
-                    headers={
-                        "Access-Control-Allow-Origin": origin,
-                        "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-                        "Access-Control-Allow-Headers": "Authorization, Content-Type, Accept, Mcp-Session-Id",
-                        "Access-Control-Max-Age": "86400",
-                        "X-Content-Type-Options": "nosniff",
-                        "X-Frame-Options": "DENY",
-                        "Referrer-Policy": "strict-origin-when-cross-origin",
-                    },
-                )
-
-            response = await call_next(request)
-
-            # --- Security headers on all responses ---
-            response.headers["X-Content-Type-Options"] = "nosniff"
-            response.headers["X-Frame-Options"] = "DENY"
-            response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-
-            # --- Force wildcard CORS on public metadata endpoints ---
-            if path in _WELLKNOWN_PATHS:
-                response.headers["Access-Control-Allow-Origin"] = "*"
-                if "Vary" in response.headers:
-                    del response.headers["Vary"]
-
-            return response
-
-    # Build ASGI app(s)
-    if transport == "both":
-        from starlette.applications import Starlette
-
-        http_app = server.streamable_http_app()
-        sse_app = server.sse_app()
-
-        seen_paths: set = set()
-        merged_routes = []
-        for route in http_app.routes:
-            path = getattr(route, "path", None)
-            if path not in seen_paths:
-                seen_paths.add(path)
-                merged_routes.append(route)
-        for route in sse_app.routes:
-            path = getattr(route, "path", None)
-            if path not in seen_paths:
-                seen_paths.add(path)
-                merged_routes.append(route)
-
-        starlette_app = Starlette(
-            debug=http_app.debug,
-            routes=merged_routes,
-            middleware=list(http_app.user_middleware),
-            lifespan=lambda app: server.session_manager.run(),
-        )
-    elif transport == "sse":
-        starlette_app = server.sse_app()
-    else:
-        starlette_app = server.streamable_http_app()
-
-    # Register the Google OAuth callback route when federation is enabled.
-    if _GOOGLE_OAUTH_CONFIG is not None:
-        import anyio
-        from starlette.responses import HTMLResponse, RedirectResponse
-        from starlette.routing import Route
-
-        from google_oauth import (
-            GoogleAuthError,
-            check_identity_allowed,
-            exchange_code,
-            verify_id_token,
-        )
-
-        google_cfg = _GOOGLE_OAUTH_CONFIG
-        google_redirect_uri = MCP_ISSUER_URL.rstrip("/") + GOOGLE_CALLBACK_PATH
-
-        def _deny(message: str, status: int) -> HTMLResponse:
-            return HTMLResponse(
-                f"<html><body><h1>Access denied</h1><p>{message}</p></body></html>",
-                status_code=status,
-            )
-
-        async def _google_callback(request: StarletteRequest):
-            if request.query_params.get("error"):
-                return _deny("Google sign-in was cancelled or failed.", 400)
-            code = request.query_params.get("code")
-            state = request.query_params.get("state")
-            if not code or not state:
-                return _deny("Missing authorization code or state.", 400)
-            if _PROVIDER is None:
-                return _deny("Server is not ready.", 503)
-
-            # Google token exchange + verification are blocking (network + crypto);
-            # run them off the event loop.
-            def _verify():
-                id_token = exchange_code(google_cfg, code, google_redirect_uri)
-                claims = verify_id_token(google_cfg, id_token)
-                return check_identity_allowed(claims, google_cfg)
-
-            try:
-                identity = await anyio.to_thread.run_sync(_verify)
-            except GoogleAuthError as exc:
-                logger.warning("Google auth denied: %s", exc)
-                return _deny("Your Google account is not permitted to access this server.", 403)
-            except Exception:  # noqa: BLE001 - defensive: never leak internals to the browser
-                logger.exception("Unexpected error during Google callback")
-                return _deny("Authentication failed. Please try again.", 500)
-
-            try:
-                redirect_url = _PROVIDER.complete_google_authorization(state, identity)
-            except KeyError:
-                return _deny("Your sign-in session expired. Please reconnect and try again.", 400)
-            return RedirectResponse(redirect_url, status_code=302)
-
-        starlette_app.router.routes.append(
-            Route(GOOGLE_CALLBACK_PATH, _google_callback, methods=["GET"])
-        )
-
-    # Middleware order (outermost → innermost):
-    #   _SecurityHeadersMiddleware → _IPAllowlistMiddleware → _TokenErrorSanitizer → app
-    # Starlette add_middleware prepends, so add in reverse order.
-    starlette_app.add_middleware(_TokenErrorSanitizer)
-    starlette_app.add_middleware(_IPAllowlistMiddleware)
-    starlette_app.add_middleware(_SecurityHeadersMiddleware)
-
-    uv_kwargs: Dict[str, Any] = {
-        "host": server.settings.host,
-        "port": server.settings.port,
-        "log_level": "info",
-    }
-    if MCP_TLS_CERTFILE and MCP_TLS_KEYFILE:
-        uv_kwargs["ssl_certfile"] = MCP_TLS_CERTFILE
-        uv_kwargs["ssl_keyfile"] = MCP_TLS_KEYFILE
-        logger.info("TLS enabled with cert %s", MCP_TLS_CERTFILE)
-    else:
-        logger.info("TLS disabled (expecting upstream TLS termination)")
-
-    config = uvicorn.Config(starlette_app, **uv_kwargs)
-    uv_server = uvicorn.Server(config)
-    await uv_server.serve()
+    The only thing esme_mcp cannot answer on its own, because it does not know what this
+    server serves. It raises on failure, and esme_mcp logs the reason and answers 503
+    without it: /health needs no token, and an exception's text names hosts and addresses.
+    """
+    async with httpx.AsyncClient(base_url=SUPERSET_BASE_URL, timeout=10.0) as client:
+        response = await client.get("/health")
+    if response.status_code != 200:
+        raise RuntimeError(f"Superset returned {response.status_code}")
 
 
 def run():
@@ -3059,7 +2639,7 @@ def run():
     parser.add_argument(
         "--transport",
         default=None,
-        choices=["stdio", "streamable-http", "sse", "both"],
+        choices=["stdio", *HTTP_TRANSPORTS],
         help="MCP transport (default: from MCP_TRANSPORT env or stdio)",
     )
     parser.add_argument(
@@ -3069,15 +2649,30 @@ def run():
     )
     args = parser.parse_args()
 
-    logging.basicConfig(level=getattr(logging, args.log_level.upper()), force=True)
-
     transport = args.transport or MCP_TRANSPORT
+
+    # The server is built at import, from MCP_TRANSPORT, because every tool below is
+    # registered on it as the module loads. A --transport that asks for HTTP when the
+    # environment did not would serve without an authorization server in front.
+    if transport in HTTP_TRANSPORTS and HTTP_CONFIG is None:
+        raise SystemExit(
+            f"--transport {transport} needs an HTTP MCP_TRANSPORT in the environment "
+            f"(streamable-http, sse or both), not {MCP_TRANSPORT!r}, so the server is built "
+            "with OAuth in front of it"
+        )
+
+    if transport in HTTP_TRANSPORTS:
+        # stdout for diagnostics and stderr for failures, so rsyslog routes them apart.
+        # Not in stdio mode: there stdout is the JSON-RPC channel.
+        configure_logging(args.log_level)
+    else:
+        logging.basicConfig(level=getattr(logging, args.log_level.upper()), force=True)
 
     logger.info("Starting Superset MCP server (transport=%s)...", transport)
 
-    if transport in ("streamable-http", "sse", "both"):
+    if transport in HTTP_TRANSPORTS:
         import anyio
-        anyio.run(_run_http, mcp, transport)
+        anyio.run(serve, mcp, HTTP_CONFIG, transport, check_superset_answers)
     else:
         mcp.run(transport="stdio")
 
