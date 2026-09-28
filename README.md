@@ -84,8 +84,9 @@ npx -y @smithery/cli install @aptro/superset-mcp --client claude
    ```
 
    `setup.sh` builds the virtualenv and installs into it: the lock first, then esme_mcp at
-   the tag the Makefile names (`ESME_MCP_SOURCE=/path/to/esme.mcp-py` installs a checkout
-   instead), with the lock reapplied after it, so `requirements.txt` decides the versions. It removes and rebuilds
+   the tag the Makefile names, cloned with the GitHub token in `ESME_MCP_GIT_TOKEN`, which
+   the up script passes and which never goes in this public repository
+   (`ESME_MCP_SOURCE=/path/to/esme.mcp-py` installs a checkout instead), with the lock reapplied after it, so `requirements.txt` decides the versions. It removes and rebuilds
    rather than installing into whatever is there -- `pip install -r` never uninstalls, and
    the security scanner reads what is installed rather than what is declared. `VENV_KEEP=1`
    reuses a healthy one while iterating locally, and `./setup.sh --print-venv-dir` says

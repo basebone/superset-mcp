@@ -85,6 +85,17 @@ command -v "$PYTHON_BIN" >/dev/null || {
     exit 1
 }
 
+# Checked before anything is deleted: esme_mcp is installed from a private repository, and
+# without the token to clone it the rebuild below would remove the virtualenv the running
+# service uses and then fail -- which is how smcp went down on 2026-09-28. The up script
+# passes ESME_MCP_GIT_TOKEN; a developer can name a checkout with ESME_MCP_SOURCE instead.
+if [ -z "${ESME_MCP_SOURCE:-}" ] && [ -z "${ESME_MCP_GIT_TOKEN:-}" ]; then
+    echo "ESME_MCP_GIT_TOKEN is not set, so esme_mcp cannot be cloned; nothing was changed." >&2
+    echo "Set it to a GitHub token with read access to basebone/esme.mcp-py, or set" >&2
+    echo "ESME_MCP_SOURCE to a checkout or a built wheel of it." >&2
+    exit 1
+fi
+
 # Removed and rebuilt, never installed into.
 #
 # `python -m venv` on a directory that already exists reuses it, and `pip install -r` does
