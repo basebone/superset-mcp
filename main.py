@@ -2724,16 +2724,21 @@ async def _run_http(server: FastMCP, transport: str) -> None:
         logger.info("IP allowlist active: %s", [str(n) for n in allow_nets])
 
     async def _health_check(request: StarletteRequest) -> JSONResponse:
-        """Unauthenticated health check — tests Superset API connectivity."""
+        """Unauthenticated health check — tests Superset API connectivity.
+
+        The reason for a failure goes to the log and never into the answer: this route
+        needs no token, and an exception's text names hosts and addresses.
+        """
         try:
             async with httpx.AsyncClient(base_url=SUPERSET_BASE_URL, timeout=10.0) as client:
                 resp = await client.get("/health")
                 if resp.status_code == 200:
                     return JSONResponse({"status": "ok"}, status_code=200)
-                return JSONResponse({"status": "error", "detail": f"Superset returned {resp.status_code}"}, status_code=503)
+                logger.error("Health check failed: Superset returned %s", resp.status_code)
+                return JSONResponse({"status": "error"}, status_code=503)
         except Exception as exc:
             logger.error("Health check failed: %s", exc)
-            return JSONResponse({"status": "error", "detail": str(exc)}, status_code=503)
+            return JSONResponse({"status": "error"}, status_code=503)
 
     class _IPAllowlistMiddleware(BaseHTTPMiddleware):
         async def dispatch(self, request: StarletteRequest, call_next):
