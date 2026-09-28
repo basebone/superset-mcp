@@ -11,15 +11,23 @@ setup:
 # on no index, so it comes from its repository at an exact tag. Pinned and not a floor: a
 # deploy that resolves whatever master happens to be is a deploy nobody can reproduce.
 ESME_MCP_VERSION ?= 1.4.1
-ESME_MCP_URL = git+https://svn2:2b8ca4d28b1fec83c6e8d4162998c8a12621b26e@github.com/basebone/esme.mcp-py.git@$(ESME_MCP_VERSION)
+# The token comes from the environment, never from this file: this repository is public,
+# and the svn2 token that used to be written here was found by GitHub's secret scanning
+# and revoked on 2026-09-28. The up script passes the one it pulls with.
+ESME_MCP_URL = git+https://svn2:$(ESME_MCP_GIT_TOKEN)@github.com/basebone/esme.mcp-py.git@$(ESME_MCP_VERSION)
 
 # Called by setup.sh with PIP pointing at the virtualenv it just built. With its
 # dependencies: esme_mcp declares google-auth, requests and cryptography, and this server
 # no longer does. The lock is reapplied afterwards so its pins win over whatever the
 # resolver picked.
+#
+# The install line is not echoed: make would print the URL with the token in it, and the
+# deploy output is kept and read by people.
 reinstall_mcp_auth:
+	@test -n "$(ESME_MCP_GIT_TOKEN)" || { echo "ESME_MCP_GIT_TOKEN is not set: it is the GitHub token esme_mcp is cloned with" >&2; exit 1; }
 	$(PIP) uninstall --no-cache-dir esme_mcp -y
-	$(PIP) install --no-cache-dir $(ESME_MCP_URL)
+	@echo "$(PIP) install --no-cache-dir git+https://svn2:***@github.com/basebone/esme.mcp-py.git@$(ESME_MCP_VERSION)"
+	@$(PIP) install --no-cache-dir $(ESME_MCP_URL)
 	$(PIP) install --no-cache-dir -r requirements.txt
 
 # Where esme.mcp-py is checked out. Override on the command line if it is not next to this
