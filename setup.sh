@@ -11,15 +11,16 @@ set -euo pipefail
 
 MYDIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 
-# 3.10 because that is what the virtualenv deployed on superset1 runs, and pyproject.toml
-# requires only >= 3.10. Note .python-version says 3.13, which is what a developer using
-# uv gets; the lock and this default follow the deployment.
+# 3.12 because pyproject.toml requires >= 3.11 for esme_mcp, and /usr/bin/python3.12 is the
+# packaged interpreter on superset1 -- the one warehousemcp's virtualenv there runs. Note
+# .python-version says 3.13, which is what a developer using uv gets; the lock and this
+# default follow the deployment.
 #
 # The absolute path, not the name: on log2 a hand-built /usr/local/bin/python3.10 sat
 # ahead of the packaged one on PATH and had no sqlite3 module, which is not something to
 # discover after the virtualenv has been deleted. This server keeps its OAuth tokens in a
 # SQLite file too.
-PYTHON_BIN="${PYTHON_BIN:-/usr/bin/python3.10}"
+PYTHON_BIN="${PYTHON_BIN:-/usr/bin/python3.12}"
 
 # Flat, no /env, and named supersetmcp while the repository is superset-mcp. Both are what
 # is deployed: the systemd unit in esme.etc names
@@ -74,7 +75,7 @@ command -v "$PYTHON_BIN" >/dev/null || {
 # cleanly and fails on the first login.
 "$PYTHON_BIN" -c 'import sqlite3' 2>/dev/null || {
     echo "$PYTHON_BIN has no sqlite3 module, which the OAuth token database needs." >&2
-    echo "On this host /usr/bin/python3.10 is the packaged one and has it." >&2
+    echo "On superset1 /usr/bin/python3.12 is the packaged one and has it." >&2
     exit 1
 }
 
@@ -118,7 +119,7 @@ echo "creating $VENV_DIR with $("$PYTHON_BIN" --version)"
 #
 # The project itself is deliberately not installed. The systemd unit runs
 #   /smsc/var/venvs/supersetmcp/bin/python main.py --transport both
-# with WorkingDirectory=/smsc/src/superset-mcp, so main, auth, token_store and google_oauth
+# with WorkingDirectory=/smsc/src/superset-mcp, so main and http_config_env
 # are imported from the checkout -- the deployed virtualenv has never held the package,
 # only its dependencies. Installing it editable writes superset_mcp.egg-info into the
 # checkout, and a checkout is not ours to write in: the tree already had a build/ and an
@@ -129,13 +130,27 @@ echo "creating $VENV_DIR with $("$PYTHON_BIN" --version)"
 # and a deploy updating the checkout would no longer change what runs.
 "$VENV_DIR/bin/python" -m pip install --quiet --no-cache-dir -r requirements.txt
 
+# esme_mcp, the OAuth authorization server and HTTP layer this server runs behind. On no
+# index, so it comes from its repository at the tag the Makefile names, with its
+# dependencies; the lock is reapplied after it so its pins win.
+#
+# ESME_MCP_SOURCE installs from a checkout or a built wheel instead.
+if [ -n "${ESME_MCP_SOURCE:-}" ]; then
+    echo "installing esme_mcp from $ESME_MCP_SOURCE"
+    "$VENV_DIR/bin/python" -m pip install --quiet --no-cache-dir --force-reinstall "$ESME_MCP_SOURCE"
+    "$VENV_DIR/bin/python" -m pip install --quiet --no-cache-dir -r requirements.txt
+else
+    PIP="$VENV_DIR/bin/python -m pip" make reinstall_mcp_auth
+fi
+
 # Verified by importing, not by running: the unit starts it with --transport both, so
 # running it here would bind a port and wait. The import resolves every dependency the lock
-# installed, which is what a bad lock breaks -- and google_oauth is named because it is the
-# module whose dependencies used to be missing from the lock in the sibling project.
+# installed, which is what a bad lock breaks -- and esme_mcp.google_oauth is named because
+# it imports requests and google.auth inside its functions, so a missing one would
+# otherwise surface at the first login.
 #
 # From this directory, because that is how the unit imports them: nothing is installed.
-( cd "$MYDIR" && "$VENV_DIR/bin/python" -c "import main, auth, token_store, google_oauth; import requests, google.auth; print('superset-mcp imports, google-auth and requests included')" )
+( cd "$MYDIR" && "$VENV_DIR/bin/python" -c "import main, http_config_env, esme_mcp, esme_mcp.google_oauth; import requests, google.auth; print('superset-mcp imports, on esme_mcp, google-auth and requests included')" )
 
 echo
 echo "done. the unit runs:  $VENV_DIR/bin/python main.py --transport both"

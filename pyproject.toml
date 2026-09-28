@@ -3,7 +3,7 @@ name = "superset-mcp"
 version = "0.1.0"
 description = "Model Control Protocol (MCP) server for Apache Superset integration with AI assistants"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = {text = "MIT"}
 authors = [
     {name = "Superset MCP Team"}
@@ -28,12 +28,15 @@ dependencies = [
     "uvicorn>=0.34.0",
     "python-dotenv>=1.0.0",
     "PyJWT>=2.8.0",
-    "google-auth>=2.28",
-    "requests>=2.31",
 ]
+# esme_mcp, the OAuth authorization server every remote MCP here runs, is on no index, so
+# it is not declared here: setup.sh installs it from its repository at the tag the
+# Makefile names. google-auth, requests and cryptography are its to declare, not this
+# project's. It is also why requires-python is 3.11: esme_mcp uses `X | None` in
+# annotations that pydantic evaluates at runtime.
 
 [tool.setuptools]
-py-modules = ["main", "auth", "auth_records", "token_store", "google_oauth"]
+py-modules = ["main", "http_config_env"]
 
 [project.urls]
 Homepage = "https://github.com/yourusername/superset-mcp"
